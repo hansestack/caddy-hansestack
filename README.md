@@ -71,7 +71,8 @@ This starts:
 Set your API key before starting:
 
 ```sh
-export HANSESTACK_API_KEY=your-real-api-key
+cp .env.skel .env
+# then edit .env and set HANSESTACK_API_KEY to your real API key
 docker compose up --build
 ```
 
@@ -107,6 +108,43 @@ hansestack leakcheck {
 | `header_leaked`    | `X-Hansestack-Leaked`       | Header set to `true`/`false` once the check completes.                 |
 | `header_count`     | `X-Hansestack-Leak-Count`   | Header set to the number of breaches the password was found in.        |
 | `block_status`     | `401`                       | HTTP status returned when `mode=block` and a leak is confirmed.        |
+
+### Directive Order
+
+`hansestack` registers itself to always run **before** `reverse_proxy` in
+Caddy's directive order, so you can write it directly inside a site block —
+no `order` global option or `route { }` block required:
+
+```caddyfile
+:80 {
+    hansestack leakcheck {
+        api_key {$HANSESTACK_API_KEY}
+    }
+    reverse_proxy backend:8080
+}
+```
+
+If you ever combine `hansestack` with other third-party plugins that also
+define their own directive order relative to `reverse_proxy`, and you need
+finer control over exactly where `hansestack` runs relative to *those*
+plugins, you can still override the position explicitly, either with the
+`order` global option:
+
+```caddyfile
+{
+    order hansestack before basic_auth
+}
+```
+
+or by placing it inside a `route { }` block, which preserves the exact order
+you write, ignoring Caddy's sorting rules entirely:
+
+```caddyfile
+route {
+    hansestack leakcheck { ... }
+    reverse_proxy backend:8080
+}
+```
 
 ### Operation Modes
 

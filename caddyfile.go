@@ -10,6 +10,16 @@ import (
 
 func init() {
 	httpcaddyfile.RegisterHandlerDirective("hansestack", parseCaddyfile)
+
+	// Directives contributed by plugins have no position in Caddy's
+	// hard-coded default directive order, so the Caddyfile adapter refuses
+	// to place them automatically ("... is not an ordered HTTP handler").
+	// Registering an explicit order here means end users can write
+	// "hansestack leakcheck { ... }" directly in a site block, with no need
+	// for a manual "order" global option or a "route" block: the leak check
+	// always runs before reverse_proxy (and other response-generating
+	// directives), which is exactly the semantics this plugin requires.
+	httpcaddyfile.RegisterDirectiveOrder("hansestack", httpcaddyfile.Before, "reverse_proxy")
 }
 
 // parseCaddyfile is the httpcaddyfile.UnmarshalHandlerFunc registered for
