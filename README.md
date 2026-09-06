@@ -289,6 +289,18 @@ go vet ./...
 go test ./... -race -cover
 ```
 
+A `Makefile` bundles the common local workflows (run `make help` for the
+full list):
+
+```sh
+make test      # go test -race
+make test-cover
+make lint      # golangci-lint
+make vuln      # govulncheck
+make verify    # tidy + lint + test — the full local check before pushing
+make up        # docker compose up -d (pulls the published GHCR image)
+```
+
 ## License
 
 See [LICENSE](./LICENSE).

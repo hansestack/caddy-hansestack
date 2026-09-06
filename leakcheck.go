@@ -329,7 +329,7 @@ type enrichingResponseWriter struct {
 func (rw *enrichingResponseWriter) applyResult() {
 	rw.once.Do(func() {
 		res := <-rw.resultCh
-		rw.mw.setHeaders(rw.ResponseWriter.Header(), res)
+		rw.mw.setHeaders(rw.Header(), res)
 	})
 }
 
@@ -376,7 +376,11 @@ func extractPassword(r *http.Request, field string) (password string, found bool
 	mediaType, _, parseErr := mime.ParseMediaType(contentType)
 	if parseErr != nil {
 		// No/unparseable Content-Type: not our business, skip silently.
-		// r.Body is untouched.
+		// r.Body is untouched. Deliberately swallowing parseErr here (not
+		// wrapping it into the returned error) — an unparseable/missing
+		// Content-Type is an expected, common case (e.g. GET requests),
+		// not a failure worth surfacing to the caller.
+		//nolint:nilerr // intentional: unparseable Content-Type is "nothing to check", not an error.
 		return "", false, nil
 	}
 
