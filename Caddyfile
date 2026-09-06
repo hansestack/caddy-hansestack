@@ -1,0 +1,20 @@
+{
+	# Global options for local/dev use inside docker-compose.
+	admin off
+}
+
+:80 {
+	# Zero-code enterprise integration: the Hansestack middleware sits in
+	# front of the backend and enriches requests/responses without the
+	# backend ever needing to know it exists.
+	hansestack leakcheck {
+		api_key {$HANSESTACK_API_KEY}
+		mode enrich_response
+		password_field "password"
+		header_leaked "X-Hansestack-Leaked"
+		header_count "X-Hansestack-Leak-Count"
+		block_status 401
+	}
+
+	reverse_proxy dummy-backend:80
+}

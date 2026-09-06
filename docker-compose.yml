@@ -1,0 +1,40 @@
+services:
+  # Caddy, custom-built with the Hansestack leak-check plugin baked in.
+  caddy:
+    build: .
+    container_name: hansestack-caddy
+    restart: always
+    ports:
+      - "8080:80"
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      # Secret injection: the API key never lives in the Caddyfile itself,
+      # only the {$HANSESTACK_API_KEY} placeholder does. Caddy resolves it
+      # from this environment variable at config-load time.
+      HANSESTACK_API_KEY: ${HANSESTACK_API_KEY:?HANSESTACK_API_KEY must be set}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      - dummy-backend
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  # The protected target (simulating a customer's backend). Zero-code
+  # integration: this container has no idea Hansestack exists.
+  dummy-backend:
+    image: traefik/whoami
+    container_name: hansestack-dummy-backend
+    expose:
+      - "80"
+
+volumes:
+  caddy_data:
+  caddy_config:
