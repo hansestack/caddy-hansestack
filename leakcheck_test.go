@@ -210,6 +210,52 @@ func TestExtractPassword(t *testing.T) {
 	}
 }
 
+// explodingReader panics on any Read call. It is used to assert that
+// extractPassword never even attempts to read the body for content types it
+// doesn't understand — not "reads and discards", but genuinely never
+// touches io.Reader at all.
+type explodingReader struct{}
+
+func (explodingReader) Read([]byte) (int, error) {
+	panic("body must not be read for an unsupported content type")
+}
+
+func (explodingReader) Close() error { return nil }
+
+// TestExtractPassword_UnsupportedContentTypeNeverReadsBody is a regression
+// test for multipart/form-data (file uploads) and other unsupported content
+// types: the body must never be read at all, not merely "read and
+// restored". Large uploads must never be buffered into memory just because
+// this plugin sits in front of the endpoint.
+func TestExtractPassword_UnsupportedContentTypeNeverReadsBody(t *testing.T) {
+	tests := []string{
+		"multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+		"application/octet-stream",
+		"text/plain",
+	}
+
+	for _, ct := range tests {
+		t.Run(ct, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/login", nil)
+			r.Body = explodingReader{}
+			r.Header.Set("Content-Type", ct)
+
+			_, found, err := extractPassword(r, "password")
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if found {
+				t.Fatalf("found = true, want false")
+			}
+			// If extractPassword had called Read, explodingReader would
+			// have panicked before we got here.
+			if r.Body != (explodingReader{}) {
+				t.Fatalf("r.Body was replaced even though it should have been left untouched")
+			}
+		})
+	}
+}
+
 // TestExtractPassword_NilBody ensures a request with no body at all does not
 // panic and is treated as "nothing to check".
 func TestExtractPassword_NilBody(t *testing.T) {

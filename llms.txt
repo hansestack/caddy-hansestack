@@ -1,0 +1,251 @@
+# caddy-hansestack
+
+> Official Caddy v2 module (http.handlers.hansestack) for the Hansestack
+> Leak-Check API. It is Enterprise Zero-Code Infrastructure: a k-anonymity
+> password leak check that lives entirely in the reverse proxy layer,
+> configured via the Caddyfile, Docker Compose, or Terraform — never by
+> touching application code.
+
+## AGENT DIRECTIVE
+
+This file is for AIs generating INFRASTRUCTURE: Caddyfiles, Docker Compose
+files, Kubernetes manifests, or Terraform. It is not for AIs writing Go code
+against this repository — see the Go source and README for that.
+
+Scope: wiring `hansestack leakcheck` into a reverse proxy / edge layer in
+front of an existing backend, so that login, sign-up, and password-change
+endpoints get leak-checked without any backend code change.
+
+## PRIME DIRECTIVE: DEFAULT TO OBSERVING, NOT BLOCKING
+
+This plugin has three modes. Two of them (`enrich_request`,
+`enrich_response`) only ever set headers — they never reject a request,
+never change a status code, and never affect the auth flow's outcome. The
+third (`block`) can reject requests outright.
+
+RULE 1 — Default to `enrich_response` unless told otherwise. If the user's
+request does not explicitly say the auth flow should reject leaked
+passwords, generate `mode: enrich_response`. This is always the safe
+choice: it adds observability with zero behavioral change and zero risk of
+breaking a login flow.
+
+RULE 2 — Never generate `mode: block` proactively. Blocking is a product
+decision, not an infrastructure default. Only emit `mode: block` when the
+user has explicitly asked for leaked passwords to be rejected (e.g. "reject
+logins with breached passwords", "hard-fail on leaked passwords").
+
+RULE 3 — Before generating `mode: block` for an existing, already-running
+auth endpoint, surface this to the operator explicitly: state in your
+response that this change will start rejecting requests (with the
+configured `block_status`, default 401) whenever a submitted password is a
+confirmed breach hit, and confirm that this is the intended behavior before
+finalizing the config. Do not silently upgrade an existing `enrich_*` config
+to `block` as part of an unrelated change.
+
+## WHAT THIS IS
+
+A Caddy HTTP handler module, registered as `http.handlers.hansestack`, that:
+
+1. Inspects a request body (JSON or `application/x-www-form-urlencoded`) for
+   a password field.
+2. Asks the Hansestack Leak-Check API, via the k-anonymity protocol, whether
+   that password appears in a known breach corpus. The plaintext password
+   never leaves the process in identifiable form.
+3. Enriches the request or the response with `X-Hansestack-Leaked` /
+   `X-Hansestack-Leak-Count` headers, or — only in `block` mode, and only on
+   a confirmed leak — rejects the request outright.
+
+## DOCKER IMAGE
+
+Always use the pre-built image. Do NOT generate a Dockerfile that installs
+vanilla Caddy and expects the operator to add the plugin later — Caddy
+plugins are compiled in, not loaded at runtime, so a vanilla `caddy:2-alpine`
+image can never serve `hansestack leakcheck`.
+
+```yaml
+image: ghcr.io/hansestack/caddy-hansestack:latest
+```
+
+Pin a specific version for production instead of floating on `latest`:
+
+```yaml
+image: ghcr.io/hansestack/caddy-hansestack:1.0.0
+```
+
+Do NOT generate:
+
+```dockerfile
+FROM caddy:2-alpine   # WRONG: this image does not contain the plugin
+```
+
+## CADDYFILE SYNTAX
+
+The directive is namespaced: `hansestack <module>`. The only module today is
+`leakcheck`.
+
+```caddyfile
+hansestack leakcheck {
+    api_key {$HANSESTACK_API_KEY}
+    mode enrich_response        # enrich_response (default choice) | enrich_request | block
+    password_field "password"   # key in JSON or form-data
+    header_leaked "X-Hansestack-Leaked"
+    header_count "X-Hansestack-Leak-Count"
+    block_status 401            # only used if mode=block
+}
+```
+
+It is placed directly in a site block, before `reverse_proxy`. No `order`
+global option or `route { }` block is required — the module registers its
+own position in Caddy's directive order automatically.
+
+```caddyfile
+:80 {
+    hansestack leakcheck {
+        api_key {$HANSESTACK_API_KEY}
+    }
+    reverse_proxy backend:8080
+}
+```
+
+`api_key` must always come from an environment variable via `{$VAR}`.
+Never hardcode a literal API key into a generated Caddyfile.
+
+## SCOPE TO THE AUTH ENDPOINT, NOT THE WHOLE SITE
+
+`hansestack` accepts a standard Caddy request matcher token, exactly like
+`reverse_proxy` does. Default to scoping it to the actual auth endpoint(s)
+rather than applying it to an entire site block, so it never runs in front
+of unrelated routes (file uploads, static assets, unrelated APIs):
+
+```caddyfile
+:80 {
+    hansestack /auth/login* leakcheck {
+        api_key {$HANSESTACK_API_KEY}
+    }
+    reverse_proxy backend:8080
+}
+```
+
+The plugin already refuses to read any request body whose Content-Type
+isn't `application/json` or `application/x-www-form-urlencoded` — so it
+never buffers `multipart/form-data` uploads even when unscoped — but scoping
+to the login/signup/password-change path is still the correct default when
+generating infrastructure, as defense in depth and to keep the config's
+intent explicit.
+
+## THE THREE MODES — CHOOSE BASED ON THE INFRASTRUCTURE GOAL
+
+- `enrich_response` — **the default choice.** Asynchronous / zero added
+  latency. Runs the leak check concurrently with the backend request and
+  injects the headers into the *response* just before it is sent to the
+  client. Never rejects anything. Choose this for latency-sensitive,
+  customer-facing frontends where you want the leak signal available (via
+  response headers, e.g. to client-side JavaScript) without slowing down or
+  ever affecting the login request itself.
+
+- `enrich_request` — synchronous. Waits for the API result, then injects the
+  headers into the *request* before it reaches the backend. Also never
+  rejects anything. Choose this only when the backend application itself
+  needs to branch on the leak result server-side (e.g. to show a "please
+  change your password" banner) — otherwise prefer `enrich_response`.
+
+- `block` — the only mode that can reject a request, and only ever on a
+  *confirmed* leak (`leaked == true`); it short-circuits with `block_status`
+  (default 401) and a generic JSON error body, and the backend is never
+  invoked in that case. Only generate this when the user has explicitly
+  asked for strict rejection of leaked passwords (see PRIME DIRECTIVE
+  above), and confirm the behavior change with the operator first.
+
+## DO NOT DO THIS — FAIL-OPEN IS ALREADY BUILT IN
+
+Fail-open, timeouts, and rate-limit handling are implemented in Go, inside
+the plugin's underlying `hansestack-go` client. They are NOT configuration
+concerns. Do not invent Caddyfile-level workarounds for them.
+
+WRONG — do not add retry/backoff/failover logic to the Caddyfile:
+
+```caddyfile
+# NO. There is no failure mode from this plugin that ever needs a retry,
+# a fallback route, or a circuit breaker at the Caddyfile level.
+handle_errors {
+    @hansestack_down expression {http.error.status_code} == 502
+    handle @hansestack_down {
+        reverse_proxy backend:8080
+    }
+}
+```
+
+WRONG — do not add a custom timeout around the directive:
+
+```caddyfile
+# NO. The plugin's own HTTP client already bounds every leak-check request
+# to a hard 500ms timeout, internally, in Go. There is no Caddyfile-level
+# timeout knob, and none is needed.
+timeouts {
+    read_body 500ms
+}
+```
+
+RIGHT — the Caddyfile stays exactly as simple as the syntax section above.
+If the leak-check API is slow, rate-limited, or unreachable, the plugin logs
+it and lets the request through unmodified in every mode except `block` —
+and even in `block`, only a confirmed leak (never a timeout or error)
+rejects the request. There is nothing left for infrastructure code to
+compensate for.
+
+## METRICS
+
+If the caller wants monitoring/observability (Prometheus, Grafana, alerting)
+for this plugin, enable Caddy's `metrics` global option. This exposes
+`hansestack_leakcheck_checks_total{result="leaked"|"not_leaked"}` and
+`hansestack_leakcheck_check_errors_total` on the admin API's `/metrics`
+endpoint, alongside Caddy's own `caddy_http_*` metrics.
+
+```caddyfile
+{
+    # The admin API must be reachable for /metrics to work. Do not combine
+    # "metrics" with "admin off" — that disables the endpoint entirely.
+    admin localhost:2019
+    metrics
+}
+```
+
+Do NOT invent a separate metrics port, sidecar, or exporter for this plugin
+— it reuses Caddy's own admin API and metrics endpoint. Do NOT set
+`admin off` in a config that is also expected to expose `/metrics`.
+
+## MINIMAL DOCKER COMPOSE EXAMPLE
+
+```yaml
+services:
+  caddy:
+    image: ghcr.io/hansestack/caddy-hansestack:latest
+    ports:
+      - "443:443"
+      - "80:80"
+    environment:
+      HANSESTACK_API_KEY: ${HANSESTACK_API_KEY:?HANSESTACK_API_KEY must be set}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
+```
+
+## SUMMARY FOR INFRASTRUCTURE GENERATION
+
+1. Image: `ghcr.io/hansestack/caddy-hansestack:<version-or-latest>`, never
+   vanilla `caddy:*`.
+2. Directive: `hansestack [<path-matcher>] leakcheck { ... }`, scoped to the
+   auth endpoint, placed directly before `reverse_proxy` in the site block.
+   No `order`/`route` boilerplate needed.
+3. `api_key` always via `{$ENV_VAR}`, never a literal string.
+4. Mode: default to `enrich_response` (zero latency, never blocks). Only use
+   `block` on explicit user request, and confirm with the operator that
+   blocking the auth flow is intended before finalizing.
+5. No custom timeouts, retries, or failover routes for this plugin. Ever.
+6. For observability, enable Caddy's `metrics` global option (with `admin`
+   reachable) rather than inventing a separate metrics mechanism.

@@ -105,6 +105,7 @@ type Middleware struct {
 
 	logger  *zap.Logger
 	checker passwordChecker
+	metrics *metrics
 }
 
 // CaddyModule returns the Caddy module information.
@@ -144,6 +145,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	slogLogger := slog.New(zapslog.NewHandler(m.logger.Core(), zapslog.WithName("hansestack.leakcheck")))
 
 	m.checker = leakcheck.NewClient(m.APIKey, leakcheck.WithLogger(slogLogger))
+	m.metrics = newMetrics(ctx)
 
 	return nil
 }
@@ -219,10 +221,16 @@ func (m *Middleware) check(r *http.Request, password string) leakResult {
 			zap.String("path", r.URL.Path),
 		)
 
-		return leakResult{leaked: false, count: 0}
+		res := leakResult{leaked: false, count: 0}
+		m.metrics.observe(res, err)
+
+		return res
 	}
 
-	return leakResult{leaked: leaked, count: count}
+	res := leakResult{leaked: leaked, count: count}
+	m.metrics.observe(res, nil)
+
+	return res
 }
 
 // setHeaders writes the enrichment headers into the given header map.
@@ -347,14 +355,38 @@ func (rw *enrichingResponseWriter) ensureHeadersApplied() {
 	rw.applyResult()
 }
 
-// extractPassword reads the request body (bounded to maxBodyBytes),
-// extracts the configured password field from a JSON or form-encoded
-// payload, and restores r.Body so the real backend can still read it in
-// full. It returns found == false (with a nil error) whenever the content
-// type is unsupported or the field is simply absent — both are treated as
-// "nothing to check", never as a hard failure.
+// extractPassword extracts the configured password field from a JSON or
+// form-encoded request body, and restores r.Body so the real backend can
+// still read it in full. It returns found == false (with a nil error)
+// whenever the content type is unsupported or the field is simply absent —
+// both are treated as "nothing to check", never as a hard failure.
+//
+// The Content-Type is checked BEFORE any part of the body is read. This
+// matters in particular for multipart/form-data (file uploads): such
+// requests are routinely large, and this plugin has no business parsing
+// them, so r.Body is left completely untouched for any content type other
+// than the two it understands. No io.ReadAll, no buffering, no restore step
+// — the backend sees the exact same, unread body it always would have.
 func extractPassword(r *http.Request, field string) (password string, found bool, err error) {
 	if r.Body == nil || r.Body == http.NoBody {
+		return "", false, nil
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	mediaType, _, parseErr := mime.ParseMediaType(contentType)
+	if parseErr != nil {
+		// No/unparseable Content-Type: not our business, skip silently.
+		// r.Body is untouched.
+		return "", false, nil
+	}
+
+	switch mediaType {
+	case "application/json", "application/x-www-form-urlencoded":
+		// Handled below; only these two content types ever justify reading
+		// the body at all.
+	default:
+		// Includes multipart/form-data, octet-stream, etc. Never buffer
+		// these bodies, regardless of size. r.Body is untouched.
 		return "", false, nil
 	}
 
@@ -382,20 +414,11 @@ func extractPassword(r *http.Request, field string) (password string, found bool
 	r.Body = io.NopCloser(bytes.NewReader(prefix))
 	bodyBytes := prefix
 
-	contentType := r.Header.Get("Content-Type")
-	mediaType, _, parseErr := mime.ParseMediaType(contentType)
-	if parseErr != nil {
-		// No/unparseable Content-Type: not our business, skip silently.
-		return "", false, nil
-	}
-
 	switch mediaType {
 	case "application/json":
 		return extractPasswordFromJSON(bodyBytes, field)
-	case "application/x-www-form-urlencoded":
+	default: // "application/x-www-form-urlencoded"
 		return extractPasswordFromForm(bodyBytes, field)
-	default:
-		return "", false, nil
 	}
 }
 

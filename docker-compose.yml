@@ -6,6 +6,10 @@ services:
     restart: always
     ports:
       - "8080:80"
+      # Admin API / Prometheus metrics endpoint (see Caddyfile's "metrics"
+      # global option). Bound to localhost only inside the container; only
+      # exposed here for local scraping/debugging convenience.
+      - "127.0.0.1:2019:2019"
     env_file:
       - .env
     environment:

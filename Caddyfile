@@ -1,13 +1,28 @@
 {
-	# Global options for local/dev use inside docker-compose.
-	admin off
+	# The admin API serves /metrics below. Do not set "admin off" if you
+	# want metrics reachable — that disables the admin API entirely.
+	#
+	# Bound to all interfaces here (0.0.0.0) so that Docker's published port
+	# mapping below can reach it; the docker-compose.yml only forwards it to
+	# 127.0.0.1 on the HOST, so it is not exposed to the outside network.
+	# If running Caddy directly on a host (not in a container), bind this to
+	# "localhost:2019" instead and skip publishing it anywhere.
+	admin 0.0.0.0:2019
+
+	# Exposes this plugin's hansestack_leakcheck_* Prometheus counters (and
+	# Caddy's own caddy_http_* metrics) on the admin API's /metrics endpoint.
+	metrics
 }
 
 :80 {
 	# Zero-code enterprise integration: the Hansestack middleware sits in
 	# front of the backend and enriches requests/responses without the
 	# backend ever needing to know it exists.
-	hansestack leakcheck {
+	#
+	# Scoped to /login* so that every other route (uploads, static assets,
+	# ...) reaches reverse_proxy directly, without this plugin inspecting
+	# their request bodies at all.
+	hansestack /login* leakcheck {
 		api_key {$HANSESTACK_API_KEY}
 		mode enrich_response
 		password_field "password"

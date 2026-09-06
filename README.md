@@ -148,35 +148,111 @@ route {
 
 ### Operation Modes
 
+**`enrich_response` is the recommended default.** It only ever sets headers
+— it never rejects a request, never changes a status code, and never adds
+latency. Reach for `block` only when you have explicitly decided that your
+auth flow must reject known-leaked passwords outright; that is a product
+decision your team should make on purpose, not a side effect of installing
+this plugin.
+
+- **`enrich_response`** (asynchronous, default-recommended): starts the leak
+  check concurrently with the downstream handler chain, then blocks only the
+  outgoing `WriteHeader` call — for the duration of the (500ms-bounded) API
+  call at most — to inject `header_leaked`/`header_count` into the
+  *response* before it is sent to the client. This adds effectively zero
+  latency if your backend takes longer than the leak check to respond, and
+  nothing is ever blocked: your login endpoint's behavior is completely
+  unchanged, just observed.
 - **`enrich_request`** (synchronous): waits for the API result, then injects
-  `header_leaked`/`header_count` into the *request* headers before calling
-  the next handler. Useful if your backend itself wants to branch on the
-  result.
-- **`enrich_response`** (asynchronous): starts the leak check concurrently
-  with the downstream handler chain, then blocks only the outgoing
-  `WriteHeader` call — for the duration of the (500ms-bounded) API call at
-  most — to inject the headers into the *response* before it is sent to the
-  client. This adds effectively zero latency if your backend takes longer
-  than the leak check to respond.
-- **`block`** (synchronous): waits for the API result. If, and only if, the
-  API affirmatively confirms `leaked == true`, the request is
-  short-circuited with `block_status` and a generic JSON error body — your
-  backend is never invoked. Any other outcome (not leaked, timeout,
-  rate-limited, API error) passes the request through untouched.
+  the same headers into the *request* instead, before calling the next
+  handler. Useful if your backend itself wants to branch on the result
+  server-side (e.g. to show a "please change your password" notice). Also
+  never blocks anything by itself — it only adds headers your application
+  can choose to read or ignore.
+- **`block`** (synchronous — the only mode that can reject a request):
+  waits for the API result. If, and only if, the API affirmatively confirms
+  `leaked == true`, the request is short-circuited with `block_status` and a
+  generic JSON error body — your backend is never invoked. Any other
+  outcome (not leaked, timeout, rate-limited, API error) passes the request
+  through untouched. Choose this deliberately, and confirm with whoever owns
+  the auth flow that rejecting known-leaked passwords outright is the
+  intended behavior before enabling it in production.
+
+### Scoping to Specific Paths
+
+`hansestack` is registered as a standard Caddy HTTP handler directive, so it
+accepts an optional [request matcher](https://caddyserver.com/docs/caddyfile/matchers)
+token, exactly like `reverse_proxy` or `header` do. Use this to restrict the
+leak check to your actual authentication endpoints, rather than running it
+in front of every request the site block handles:
+
+```caddyfile
+:80 {
+    hansestack /auth/login* leakcheck {
+        api_key {$HANSESTACK_API_KEY}
+    }
+    reverse_proxy backend:8080
+}
+```
+
+With this in place, requests to `/auth/login*` are inspected as described
+above, while every other request (uploads, static assets, unrelated API
+calls) reaches `reverse_proxy` directly, without `hansestack` ever touching
+the request body. This matters in particular for `multipart/form-data`
+(file upload) endpoints elsewhere on the same site: since the plugin checks
+the `Content-Type` before reading a single byte of the body, and skips
+anything that isn't `application/json` or
+`application/x-www-form-urlencoded`, those requests are never buffered by
+this plugin regardless of scoping — but scoping to your login/signup/
+password-change endpoints is still recommended defense in depth, so the
+plugin's code path is only ever exercised where it's actually meant to run.
 
 ## Security Notes
 
-- The request body is read through `io.LimitReader` (1 MiB cap) before
-  parsing, to bound memory usage against oversized or malicious payloads.
-  Bodies over the limit are left completely unparsed (no password check
-  runs) but are still forwarded to your backend byte-for-byte.
-- Only `application/json` and `application/x-www-form-urlencoded` bodies are
-  inspected. Any other content type (or a missing one) is passed through
-  untouched, without error.
+- **The `Content-Type` header is checked before a single byte of the body is
+  read.** Only `application/json` and `application/x-www-form-urlencoded`
+  are ever inspected; any other content type — including
+  `multipart/form-data` file uploads — is passed through completely
+  untouched. `r.Body` is never wrapped, read, or replaced in that case, so
+  large uploads are never buffered into memory just because this plugin is
+  installed in front of the endpoint.
+- For the two content types that are inspected, the body is read through
+  `io.LimitReader` (1 MiB cap) to bound memory usage against oversized or
+  malicious payloads. Bodies over the limit are left completely unparsed (no
+  password check runs) but are still forwarded to your backend byte-for-byte.
 - The plaintext password is only ever handed to the official
   `hansestack-go` client's `CheckPassword` method, in-process, for the
   duration of a single k-anonymity lookup. It is never logged, cached, or
   written to disk by this plugin.
+- See [Scoping to Specific Paths](#scoping-to-specific-paths) above for how
+  to additionally restrict which routes run through this plugin at all.
+
+## Metrics
+
+If Caddy's [`metrics`](https://caddyserver.com/docs/metrics) global option
+is enabled, this plugin exposes its own Prometheus counters on Caddy's
+built-in `/metrics` endpoint, under a dedicated `hansestack_leakcheck_*`
+namespace (distinct from Caddy's own `caddy_http_*` metrics, since these
+describe a Hansestack API outcome, not an HTTP server statistic):
+
+```caddyfile
+{
+    metrics
+}
+```
+
+| Metric                                        | Type    | Description                                                                 |
+| ---------------------------------------------- | ------- | ---------------------------------------------------------------------------|
+| `hansestack_leakcheck_checks_total{result}`    | Counter | Total passwords checked, labeled `result="leaked"` or `result="not_leaked"`.|
+| `hansestack_leakcheck_check_errors_total`      | Counter | Total checks that fell back to fail-open because the API client errored. In the default configuration this should stay at zero; a nonzero rate signals a misconfiguration (e.g. an invalid API key) worth investigating, even though no end user was ever affected. |
+
+Example query — leak rate over the last 5 minutes:
+
+```promql
+sum(rate(hansestack_leakcheck_checks_total{result="leaked"}[5m]))
+/
+sum(rate(hansestack_leakcheck_checks_total[5m]))
+```
 
 ## Development
 
