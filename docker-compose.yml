@@ -1,7 +1,16 @@
 services:
-  # Caddy, custom-built with the Hansestack leak-check plugin baked in.
+  # Caddy, pre-built with the Hansestack leak-check plugin baked in.
+  # Pulls the official image from GHCR — no local Go/xcaddy toolchain or
+  # repo clone required to run this stack. Pin a specific version
+  # (e.g. ghcr.io/hansestack/caddy-hansestack:1.0.0) for production instead
+  # of floating on :latest.
   caddy:
-    build: .
+    image: ghcr.io/hansestack/caddy-hansestack:latest
+    pull_policy: always
+    # For local plugin development instead, comment out "image" and
+    # "pull_policy" above and uncomment the line below to build from the
+    # working tree:
+    # build: .
     container_name: hansestack-caddy
     restart: always
     ports:

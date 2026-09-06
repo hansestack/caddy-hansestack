@@ -52,29 +52,31 @@ so operators see it, but end users are never affected.
 xcaddy build --with github.com/hansestack/caddy-hansestack
 ```
 
-### Option B: Clone and build the Docker image
+### Option B: Docker Compose with the pre-built GHCR image (easiest)
+
+No Go toolchain, no `xcaddy`, no local build — just the pre-built image and
+a Caddyfile:
 
 ```sh
 git clone https://github.com/hansestack/caddy-hansestack.git
 cd caddy-hansestack
-docker compose up --build
+cp .env.skel .env
+# then edit .env and set HANSESTACK_API_KEY to your real API key
+docker compose up -d
 ```
 
-This starts:
+This pulls `ghcr.io/hansestack/caddy-hansestack:latest` and starts:
 
-- `caddy` — a custom-built Caddy binary with the Hansestack plugin, listening
-  on `localhost:8080`
+- `caddy` — the official pre-built Caddy binary with the Hansestack plugin,
+  listening on `localhost:8080`
 - `dummy-backend` — a [`traefik/whoami`](https://hub.docker.com/r/traefik/whoami)
   container standing in for your real backend, completely unaware that
   Hansestack is in front of it
 
-Set your API key before starting:
-
-```sh
-cp .env.skel .env
-# then edit .env and set HANSESTACK_API_KEY to your real API key
-docker compose up --build
-```
+For production, pin an explicit version instead of floating on `:latest` —
+see [Releasing & Versioning](#releasing--versioning) below — and for local
+plugin development, `docker-compose.yml` has a commented-out `build: .` line
+you can swap in instead of the `image:`/`pull_policy:` lines.
 
 Then try it out:
 
@@ -252,6 +254,31 @@ Example query — leak rate over the last 5 minutes:
 sum(rate(hansestack_leakcheck_checks_total{result="leaked"}[5m]))
 /
 sum(rate(hansestack_leakcheck_checks_total[5m]))
+```
+
+## Releasing & Versioning
+
+Versions follow [SemVer](https://semver.org) via Git tags (`vX.Y.Z`, e.g.
+`v1.0.0`). Pushing such a tag triggers `.github/workflows/release.yml`,
+which:
+
+1. Re-runs the full quality gate (build, vet, gofmt, `go mod tidy` drift
+   check, race-tested unit tests) on the tagged commit.
+2. Builds the `Dockerfile` for `linux/amd64` and `linux/arm64`, and pushes it
+   to `ghcr.io/hansestack/caddy-hansestack`, tagged with the exact version
+   (e.g. `1.0.0`, `1.0`) and moved forward as `latest`.
+3. Publishes a GitHub Release with auto-generated release notes.
+
+Consumers can pin either mechanism to a specific version:
+
+```sh
+# Docker
+image: ghcr.io/hansestack/caddy-hansestack:1.0.0
+```
+
+```sh
+# xcaddy / go get
+xcaddy build --with github.com/hansestack/caddy-hansestack@v1.0.0
 ```
 
 ## Development
