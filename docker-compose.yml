@@ -6,7 +6,7 @@ services:
   # of floating on :latest.
   caddy:
     image: ghcr.io/hansestack/caddy-hansestack:latest
-    # pull_policy: always
+    pull_policy: always
     # For local plugin development instead, comment out "image" and
     # "pull_policy" above and uncomment the line below to build from the
     # working tree:
