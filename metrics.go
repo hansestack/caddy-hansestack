@@ -29,10 +29,22 @@ const (
 // Caddyfile), since Prometheus collectors must be registered exactly once
 // per process/registry.
 type metrics struct {
-	// checksTotal counts every completed leak check, labeled by outcome.
-	// It is only incremented once the Hansestack API (or the fail-open
-	// path) has produced a definitive leaked/not-leaked result.
+	// checksTotal counts every completed leak check, labeled by whether the
+	// password was found leaked. It is incremented regardless of whether
+	// the check actually reached the API or was skipped under fail-open
+	// (see checkOutcomesTotal for that distinction); a skipped check is
+	// always reported here as "not_leaked", per the fail-open contract.
 	checksTotal *prometheus.CounterVec
+
+	// checkOutcomesTotal counts every completed leak check labeled by
+	// leakcheck.Outcome (e.g. "checked", "skipped_timeout",
+	// "skipped_rate_limited", "skipped_circuit_open", "skipped_error",
+	// "skipped_canceled"). This is the reasoning behind checksTotal: under
+	// fail-open, a skipped check and a clean miss are indistinguishable in
+	// checksTotal alone, but here they carry different outcome labels, so
+	// operators can tell "confirmed not leaked" apart from "the check
+	// didn't run, and here is why".
+	checkOutcomesTotal *prometheus.CounterVec
 
 	// checkErrorsTotal counts checks that fell back to the fail-open path
 	// because the underlying client returned an error. In the default
@@ -58,6 +70,13 @@ func newMetrics(ctx caddy.Context) *metrics {
 		Help:      "Total number of passwords checked against the Hansestack Leak-Check API, labeled by result.",
 	}, []string{"result"})
 
+	checkOutcomesTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "check_outcomes_total",
+		Help:      "Total number of leak checks, labeled by outcome (checked, skipped_timeout, skipped_rate_limited, skipped_circuit_open, skipped_error, skipped_canceled): the reasoning behind whether a check actually reached the API.",
+	}, []string{"outcome"})
+
 	checkErrorsTotal := prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
@@ -66,8 +85,9 @@ func newMetrics(ctx caddy.Context) *metrics {
 	})
 
 	return &metrics{
-		checksTotal:      mustRegisterOrReuseVec(registry, checksTotal),
-		checkErrorsTotal: mustRegisterOrReuseCounter(registry, checkErrorsTotal),
+		checksTotal:        mustRegisterOrReuseVec(registry, checksTotal),
+		checkOutcomesTotal: mustRegisterOrReuseVec(registry, checkOutcomesTotal),
+		checkErrorsTotal:   mustRegisterOrReuseCounter(registry, checkErrorsTotal),
 	}
 }
 
@@ -123,4 +143,6 @@ func (m *metrics) observe(res leakResult, err error) {
 	} else {
 		m.checksTotal.WithLabelValues(resultNotLeaked).Inc()
 	}
+
+	m.checkOutcomesTotal.WithLabelValues(res.outcome.String()).Inc()
 }

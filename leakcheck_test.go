@@ -14,6 +14,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/hansestack/hansestack-go/leakcheck"
 	"go.uber.org/zap"
 )
 
@@ -26,13 +27,20 @@ type fakeChecker struct {
 	err    error
 	delay  time.Duration
 
+	// outcome overrides the Result.Outcome returned on the success path,
+	// e.g. to simulate a fail-open skip (timeout, rate limit, circuit
+	// open, ...) that still returns a nil error. Defaults to
+	// leakcheck.OutcomeChecked (the zero value, leakcheck.OutcomeUnknown,
+	// is never a real outcome, so it is safe to treat as "unset").
+	outcome leakcheck.Outcome
+
 	mu       sync.Mutex
 	calls    int
 	lastCtx  context.Context
 	lastPass string
 }
 
-func (f *fakeChecker) CheckPassword(ctx context.Context, password string) (bool, int, error) {
+func (f *fakeChecker) CheckPassword(ctx context.Context, password string) (leakcheck.Result, error) {
 	if f.delay > 0 {
 		time.Sleep(f.delay)
 	}
@@ -43,7 +51,20 @@ func (f *fakeChecker) CheckPassword(ctx context.Context, password string) (bool,
 	f.lastPass = password
 	f.mu.Unlock()
 
-	return f.leaked, f.count, f.err
+	if f.err != nil {
+		return leakcheck.Result{}, f.err
+	}
+
+	outcome := f.outcome
+	if outcome == leakcheck.OutcomeUnknown {
+		outcome = leakcheck.OutcomeChecked
+	}
+
+	return leakcheck.Result{
+		Leaked:  f.leaked,
+		Count:   f.count,
+		Outcome: outcome,
+	}, nil
 }
 
 func newTestMiddleware(checker passwordChecker) *Middleware {
@@ -526,6 +547,38 @@ func TestServeHTTP_EnrichResponse(t *testing.T) {
 	})
 }
 
+// TestServeHTTP_SkippedCheckStillFailsOpen verifies that a check that was
+// skipped under fail-open (e.g. timeout, rate limit, circuit open) — which
+// hansestack-go reports as Result{Outcome: <skip reason>} with a nil error,
+// not leaked == true — is still surfaced as "not leaked" to headers/blocking
+// logic, while the skip reason itself is preserved on leakResult.outcome for
+// metrics/logging.
+func TestServeHTTP_SkippedCheckStillFailsOpen(t *testing.T) {
+	checker := &fakeChecker{leaked: false, count: 0, outcome: leakcheck.OutcomeSkippedTimeout}
+	m := newTestMiddleware(checker)
+	m.Mode = ModeEnrichRequest
+
+	r := jsonRequest(t, `{"password":"hunter2"}`)
+	w := httptest.NewRecorder()
+
+	var seenLeaked string
+	next := nextHandler(func(_ http.ResponseWriter, r *http.Request) {
+		seenLeaked = r.Header.Get(defaultHeaderLeaked)
+	})
+
+	if err := m.ServeHTTP(w, r, next); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if seenLeaked != "false" {
+		t.Errorf("request header leaked = %q, want %q (a skipped check must fail open)", seenLeaked, "false")
+	}
+
+	res := m.check(jsonRequest(t, `{"password":"hunter2"}`), "hunter2")
+	if res.outcome != leakcheck.OutcomeSkippedTimeout {
+		t.Errorf("leakResult.outcome = %v, want %v", res.outcome, leakcheck.OutcomeSkippedTimeout)
+	}
+}
+
 // TestServeHTTP_NoPasswordFound verifies that requests without an
 // extractable password skip the check entirely and proceed unchanged, for
 // every mode.
@@ -644,6 +697,52 @@ func TestUnmarshalCaddyfile_Defaults(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfile_Timeout(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`leakcheck {
+		api_key supersecret
+		timeout 250ms
+	}`)
+	d.Next()
+	m := new(Middleware)
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile returned error: %v", err)
+	}
+	if m.Timeout != "250ms" {
+		t.Errorf("Timeout = %q, want %q", m.Timeout, "250ms")
+	}
+}
+
+func TestUnmarshalCaddyfile_CircuitBreaker(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`leakcheck {
+		api_key supersecret
+		circuit_breaker_threshold 5
+		circuit_breaker_cooldown 30s
+	}`)
+	d.Next()
+	m := new(Middleware)
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile returned error: %v", err)
+	}
+	if m.CircuitBreakerThreshold != 5 {
+		t.Errorf("CircuitBreakerThreshold = %d, want 5", m.CircuitBreakerThreshold)
+	}
+	if m.CircuitBreakerCooldown != "30s" {
+		t.Errorf("CircuitBreakerCooldown = %q, want %q", m.CircuitBreakerCooldown, "30s")
+	}
+}
+
+func TestUnmarshalCaddyfile_InvalidCircuitBreakerThreshold(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`leakcheck {
+		api_key supersecret
+		circuit_breaker_threshold not-a-number
+	}`)
+	d.Next()
+	m := new(Middleware)
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected an error for a non-numeric circuit_breaker_threshold")
+	}
+}
+
 func TestUnmarshalCaddyfile_UnknownDirective(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`leakcheck {
 		totally_unknown foo
@@ -692,6 +791,31 @@ func TestValidate(t *testing.T) {
 		{
 			name:    "invalid block_status",
 			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 9999},
+			wantErr: true,
+		},
+		{
+			name:    "valid timeout",
+			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 401, Timeout: "250ms"},
+			wantErr: false,
+		},
+		{
+			name:    "invalid timeout",
+			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 401, Timeout: "not-a-duration"},
+			wantErr: true,
+		},
+		{
+			name:    "valid circuit breaker config",
+			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 401, CircuitBreakerThreshold: 5, CircuitBreakerCooldown: "30s"},
+			wantErr: false,
+		},
+		{
+			name:    "negative circuit_breaker_threshold",
+			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 401, CircuitBreakerThreshold: -1},
+			wantErr: true,
+		},
+		{
+			name:    "invalid circuit_breaker_cooldown",
+			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 401, CircuitBreakerThreshold: 5, CircuitBreakerCooldown: "not-a-duration"},
 			wantErr: true,
 		},
 	}

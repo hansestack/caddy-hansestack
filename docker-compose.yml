@@ -27,6 +27,13 @@ services:
       # only the {$HANSESTACK_API_KEY} placeholder does. Caddy resolves it
       # from this environment variable at config-load time.
       HANSESTACK_API_KEY: ${HANSESTACK_API_KEY:?HANSESTACK_API_KEY must be set}
+      # Optional tuning knobs for the Leak-Check API client, resolved by the
+      # Caddyfile's {$VAR:default} placeholders below. Leave unset in .env to
+      # keep hansestack-go's own defaults (500ms timeout, circuit breaker
+      # disabled).
+      HANSESTACK_TIMEOUT: ${HANSESTACK_TIMEOUT:-500ms}
+      HANSESTACK_CIRCUIT_BREAKER_THRESHOLD: ${HANSESTACK_CIRCUIT_BREAKER_THRESHOLD:-0}
+      HANSESTACK_CIRCUIT_BREAKER_COOLDOWN: ${HANSESTACK_CIRCUIT_BREAKER_COOLDOWN:-30s}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

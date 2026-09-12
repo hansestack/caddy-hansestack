@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/hansestack/hansestack-go/leakcheck"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -44,6 +45,39 @@ func TestMetrics_Observe(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(m.checkErrorsTotal); got != 1 {
 		t.Errorf("checkErrorsTotal = %v, want 1", got)
+	}
+}
+
+// TestMetrics_Observe_Outcomes verifies that observe() also records the
+// reasoning behind each check via check_outcomes_total, labeled by
+// leakcheck.Outcome — the signal that distinguishes a genuine "checked, not
+// leaked" from a fail-open skip (timeout, rate limit, circuit open, ...).
+func TestMetrics_Observe_Outcomes(t *testing.T) {
+	ctx := newTestContext(t)
+	m := newMetrics(ctx)
+
+	m.observe(leakResult{leaked: false, count: 0, outcome: leakcheck.OutcomeChecked}, nil)
+	m.observe(leakResult{leaked: true, count: 3, outcome: leakcheck.OutcomeChecked}, nil)
+	m.observe(leakResult{leaked: false, count: 0, outcome: leakcheck.OutcomeSkippedTimeout}, nil)
+	m.observe(leakResult{leaked: false, count: 0, outcome: leakcheck.OutcomeSkippedRateLimited}, nil)
+	m.observe(leakResult{leaked: false, count: 0, outcome: leakcheck.OutcomeSkippedCircuitOpen}, nil)
+	m.observe(leakResult{leaked: false, count: 0, outcome: leakcheck.OutcomeSkippedError}, errors.New("boom"))
+
+	cases := []struct {
+		outcome leakcheck.Outcome
+		want    float64
+	}{
+		{leakcheck.OutcomeChecked, 2},
+		{leakcheck.OutcomeSkippedTimeout, 1},
+		{leakcheck.OutcomeSkippedRateLimited, 1},
+		{leakcheck.OutcomeSkippedCircuitOpen, 1},
+		{leakcheck.OutcomeSkippedError, 1},
+	}
+
+	for _, tc := range cases {
+		if got := testutil.ToFloat64(m.checkOutcomesTotal.WithLabelValues(tc.outcome.String())); got != tc.want {
+			t.Errorf("checkOutcomesTotal{outcome=%s} = %v, want %v", tc.outcome, got, tc.want)
+		}
 	}
 }
 

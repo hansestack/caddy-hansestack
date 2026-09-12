@@ -91,6 +91,14 @@ hansestack leakcheck {
     header_leaked "X-Hansestack-Leaked"
     header_count "X-Hansestack-Leak-Count"
     block_status 401            # only used if mode=block
+
+    # Optional, advanced: tuning of the underlying hansestack-go client.
+    # Do NOT generate these proactively — see "DO NOT DO THIS" below. Only
+    # add them when the operator explicitly asks to tune request timeout or
+    # add a circuit breaker.
+    timeout 500ms                        # default: 500ms
+    circuit_breaker_threshold 5          # default: disabled (0)
+    circuit_breaker_cooldown 30s         # default: 30s
 }
 ```
 
@@ -158,15 +166,23 @@ intent explicit.
 
 ## DO NOT DO THIS — FAIL-OPEN IS ALREADY BUILT IN
 
-Fail-open, timeouts, and rate-limit handling are implemented in Go, inside
-the plugin's underlying `hansestack-go` client. They are NOT configuration
-concerns. Do not invent Caddyfile-level workarounds for them.
+Fail-open behavior itself (never letting a slow/unreachable API block a
+login) is implemented in Go, inside the plugin's underlying `hansestack-go`
+client, and is NOT a configuration concern. Do not invent Caddyfile-level
+workarounds for it. The plugin DOES expose two narrow, optional tuning knobs
+— `timeout` and `circuit_breaker_threshold`/`circuit_breaker_cooldown` — but
+these only change *how fast* a fail-open skip happens, never whether it
+fails open at all; only generate them on explicit operator request, never
+proactively.
 
 WRONG — do not add retry/backoff/failover logic to the Caddyfile:
 
 ```caddyfile
-# NO. There is no failure mode from this plugin that ever needs a retry,
-# a fallback route, or a circuit breaker at the Caddyfile level.
+# NO. There is no failure mode from this plugin that ever needs a retry
+# or a fallback route at the Caddyfile level. If you need faster failure
+# detection under an outage, use circuit_breaker_threshold/cooldown inside
+# the "hansestack leakcheck" block instead (see CADDYFILE SYNTAX above) —
+# never a handle_errors workaround.
 handle_errors {
     @hansestack_down expression {http.error.status_code} == 502
     handle @hansestack_down {
@@ -175,31 +191,47 @@ handle_errors {
 }
 ```
 
-WRONG — do not add a custom timeout around the directive:
+WRONG — do not add a Caddy-level timeout around the directive:
 
 ```caddyfile
-# NO. The plugin's own HTTP client already bounds every leak-check request
-# to a hard 500ms timeout, internally, in Go. There is no Caddyfile-level
-# timeout knob, and none is needed.
+# NO. There is no Caddyfile-level timeout knob that reaches into this
+# plugin's API client. If the operator wants a different request timeout,
+# use "timeout" inside the "hansestack leakcheck" block itself (see
+# CADDYFILE SYNTAX above), never Caddy's own timeouts{} directive.
 timeouts {
     read_body 500ms
 }
 ```
 
-RIGHT — the Caddyfile stays exactly as simple as the syntax section above.
-If the leak-check API is slow, rate-limited, or unreachable, the plugin logs
-it and lets the request through unmodified in every mode except `block` —
-and even in `block`, only a confirmed leak (never a timeout or error)
-rejects the request. There is nothing left for infrastructure code to
+RIGHT — the Caddyfile stays as simple as the syntax section above, with
+`timeout`/`circuit_breaker_*` added only inside the `hansestack leakcheck`
+block itself, and only when explicitly requested. If the leak-check API is
+slow, rate-limited, or unreachable, the plugin logs it and lets the request
+through unmodified in every mode except `block` — and even in `block`, only
+a confirmed leak (never a timeout, skip, or error) rejects the request.
+There is nothing left for infrastructure code outside the directive to
 compensate for.
 
 ## METRICS
 
 If the caller wants monitoring/observability (Prometheus, Grafana, alerting)
-for this plugin, enable Caddy's `metrics` global option. This exposes
-`hansestack_leakcheck_checks_total{result="leaked"|"not_leaked"}` and
-`hansestack_leakcheck_check_errors_total` on the admin API's `/metrics`
-endpoint, alongside Caddy's own `caddy_http_*` metrics.
+for this plugin, enable Caddy's `metrics` global option. This exposes three
+counters on the admin API's `/metrics` endpoint, alongside Caddy's own
+`caddy_http_*` metrics:
+
+- `hansestack_leakcheck_checks_total{result="leaked"|"not_leaked"}` — total
+  passwords checked, by verdict.
+- `hansestack_leakcheck_check_outcomes_total{outcome=...}` — the *reasoning*
+  behind every check: `outcome="checked"` means the API actually answered;
+  `"skipped_timeout"`, `"skipped_rate_limited"`, `"skipped_circuit_open"`,
+  `"skipped_error"`, `"skipped_canceled"` mean the check was skipped under
+  fail-open and `checks_total` above only holds a neutral placeholder
+  result, not a real verdict. This is the metric to alert on for "is the
+  leak check actually running".
+- `hansestack_leakcheck_check_errors_total` — checks that fell back to
+  fail-open because the API client returned a Go error. Should stay at zero
+  in the default fail-open configuration; nonzero signals a misconfiguration
+  (e.g. an invalid API key) worth investigating.
 
 ```caddyfile
 {
@@ -246,6 +278,12 @@ volumes:
 4. Mode: default to `enrich_response` (zero latency, never blocks). Only use
    `block` on explicit user request, and confirm with the operator that
    blocking the auth flow is intended before finalizing.
-5. No custom timeouts, retries, or failover routes for this plugin. Ever.
+5. No Caddy-level timeouts, retries, or failover routes for this plugin.
+   Ever. `timeout` and `circuit_breaker_threshold`/`circuit_breaker_cooldown`
+   inside the directive itself are the only supported tuning knobs, and only
+   on explicit operator request.
 6. For observability, enable Caddy's `metrics` global option (with `admin`
-   reachable) rather than inventing a separate metrics mechanism.
+   reachable) rather than inventing a separate metrics mechanism. Use
+   `hansestack_leakcheck_check_outcomes_total{outcome}` specifically to
+   monitor whether checks are actually reaching the API versus being
+   skipped under fail-open.
