@@ -130,7 +130,7 @@ jobs:
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes \
-            --verify-tag
+            --verify-tag || echo "Release already exists"
 
       - name: Warm Go module proxy
         continue-on-error: true

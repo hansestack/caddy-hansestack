@@ -24,11 +24,18 @@
 	# their request bodies at all.
 	hansestack /login* leakcheck {
 		api_key {$HANSESTACK_API_KEY}
-		mode enrich_response
+		mode enrich_request
 		password_field "password"
 		header_leaked "X-Hansestack-Leaked"
 		header_count "X-Hansestack-Leak-Count"
 		block_status 401
+
+		# Optional tuning of the underlying hansestack-go client, sourced
+		# from the environment (see .env.skel). Leave the env vars unset to
+		# keep the library defaults: a 500ms timeout and no circuit breaker.
+		timeout {$HANSESTACK_TIMEOUT:500ms}
+		circuit_breaker_threshold {$HANSESTACK_CIRCUIT_BREAKER_THRESHOLD:0}
+		circuit_breaker_cooldown {$HANSESTACK_CIRCUIT_BREAKER_COOLDOWN:30s}
 	}
 
 	reverse_proxy dummy-backend:80

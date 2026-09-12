@@ -99,17 +99,31 @@ hansestack leakcheck {
     header_leaked "X-Hansestack-Leaked"       # (default)
     header_count "X-Hansestack-Leak-Count"    # (default)
     block_status 401            # only used if mode=block (default: 401)
+
+    # Optional tuning of the underlying hansestack-go client. Leave these
+    # unset to keep the library's own defaults.
+    timeout 500ms                        # per-request timeout (default: 500ms)
+    circuit_breaker_threshold 5          # consecutive failures before tripping (default: disabled)
+    circuit_breaker_cooldown 30s         # how long the circuit stays open (default: 30s)
 }
 ```
 
-| Directive          | Default                    | Description                                                             |
-| ------------------ | -------------------------- | ------------------------------------------------------------------------|
-| `api_key`          | *(required)*                | Your Hansestack API key. Use `{$ENV_VAR}` to inject it via environment. |
-| `mode`             | `enrich_request`            | One of `enrich_request`, `enrich_response`, `block`.                    |
-| `password_field`   | `password`                  | JSON key / form field name that carries the plaintext password.        |
-| `header_leaked`    | `X-Hansestack-Leaked`       | Header set to `true`/`false` once the check completes.                 |
-| `header_count`     | `X-Hansestack-Leak-Count`   | Header set to the number of breaches the password was found in.        |
-| `block_status`     | `401`                       | HTTP status returned when `mode=block` and a leak is confirmed.        |
+| Directive                    | Default                    | Description                                                             |
+| ---------------------------- | -------------------------- | ------------------------------------------------------------------------|
+| `api_key`                    | *(required)*                | Your Hansestack API key. Use `{$ENV_VAR}` to inject it via environment. |
+| `mode`                       | `enrich_request`            | One of `enrich_request`, `enrich_response`, `block`.                    |
+| `password_field`             | `password`                  | JSON key / form field name that carries the plaintext password.        |
+| `header_leaked`              | `X-Hansestack-Leaked`       | Header set to `true`/`false` once the check completes.                 |
+| `header_count`               | `X-Hansestack-Leak-Count`   | Header set to the number of breaches the password was found in.        |
+| `block_status`               | `401`                       | HTTP status returned when `mode=block` and a leak is confirmed.        |
+| `timeout`                    | `500ms`                     | Per-request timeout against the Leak-Check API (any Caddy duration string, e.g. `500ms`, `1s`). A leak check must never become a latency bottleneck in an auth flow, so keep this small. |
+| `circuit_breaker_threshold`  | *(disabled)*                 | Number of consecutive check failures (timeouts, connection errors, 5xx, 429) after which the client stops sending requests and fails open immediately until the cooldown elapses. `0` or unset disables the breaker. |
+| `circuit_breaker_cooldown`   | `30s`                        | How long the circuit stays open before a single probe request is let through again. Only takes effect if `circuit_breaker_threshold` is set. |
+
+Both `timeout` and the circuit breaker only ever change *how fast* a fail-open
+skip happens — they never turn a skip into a rejected request. See
+[Fail-Open by Design](#fail-open-by-design) above and
+[Metrics](#metrics) below for how to observe skipped checks.
 
 ### Directive Order
 
@@ -243,10 +257,11 @@ describe a Hansestack API outcome, not an HTTP server statistic):
 }
 ```
 
-| Metric                                        | Type    | Description                                                                 |
-| ---------------------------------------------- | ------- | ---------------------------------------------------------------------------|
-| `hansestack_leakcheck_checks_total{result}`    | Counter | Total passwords checked, labeled `result="leaked"` or `result="not_leaked"`.|
-| `hansestack_leakcheck_check_errors_total`      | Counter | Total checks that fell back to fail-open because the API client errored. In the default configuration this should stay at zero; a nonzero rate signals a misconfiguration (e.g. an invalid API key) worth investigating, even though no end user was ever affected. |
+| Metric                                          | Type    | Description                                                                 |
+| ----------------------------------------------- | ------- | ---------------------------------------------------------------------------|
+| `hansestack_leakcheck_checks_total{result}`     | Counter | Total passwords checked, labeled `result="leaked"` or `result="not_leaked"`.|
+| `hansestack_leakcheck_check_outcomes_total{outcome}` | Counter | The *reasoning* behind every check, labeled `outcome="checked"`, `"skipped_timeout"`, `"skipped_rate_limited"`, `"skipped_circuit_open"`, `"skipped_error"`, or `"skipped_canceled"`. Under fail-open, a skipped check and a genuine "not leaked" both count as `result="not_leaked"` above — this metric is what tells them apart. |
+| `hansestack_leakcheck_check_errors_total`       | Counter | Total checks that fell back to fail-open because the API client errored. In the default configuration this should stay at zero; a nonzero rate signals a misconfiguration (e.g. an invalid API key) worth investigating, even though no end user was ever affected. |
 
 Example query — leak rate over the last 5 minutes:
 
@@ -255,6 +270,21 @@ sum(rate(hansestack_leakcheck_checks_total{result="leaked"}[5m]))
 /
 sum(rate(hansestack_leakcheck_checks_total[5m]))
 ```
+
+Example query — share of checks that were actually answered by the API
+(as opposed to skipped under fail-open) over the last 5 minutes:
+
+```promql
+sum(rate(hansestack_leakcheck_check_outcomes_total{outcome="checked"}[5m]))
+/
+sum(rate(hansestack_leakcheck_check_outcomes_total[5m]))
+```
+
+A sustained drop below 1.0 here — especially with a rising
+`outcome="skipped_circuit_open"` or `"skipped_timeout"` rate — means the
+Leak-Check API is degraded or unreachable; end users are unaffected (every
+mode except `block` still passes requests through, and `block` still only
+rejects on a *confirmed* leak), but the leak check itself isn't running.
 
 ## Releasing & Versioning
 

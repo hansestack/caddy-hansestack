@@ -34,6 +34,9 @@ func init() {
 //	    header_leaked "X-Hansestack-Leaked"
 //	    header_count "X-Hansestack-Leak-Count"
 //	    block_status 401
+//	    timeout 500ms
+//	    circuit_breaker_threshold 5
+//	    circuit_breaker_cooldown 30s
 //	}
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	d := h.Dispenser
@@ -107,6 +110,28 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("invalid block_status %q: %v", d.Val(), err)
 			}
 			m.BlockStatus = status
+
+		case "timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.Timeout = d.Val()
+
+		case "circuit_breaker_threshold":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			threshold, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("invalid circuit_breaker_threshold %q: %v", d.Val(), err)
+			}
+			m.CircuitBreakerThreshold = threshold
+
+		case "circuit_breaker_cooldown":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.CircuitBreakerCooldown = d.Val()
 
 		default:
 			return d.Errf("unrecognized hansestack leakcheck subdirective %q", d.Val())

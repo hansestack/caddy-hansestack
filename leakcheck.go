@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -71,7 +72,7 @@ const (
 // spinning up a real HTTP server behind the unexported base-URL override of
 // the hansestack-go client.
 type passwordChecker interface {
-	CheckPassword(ctx context.Context, password string) (leaked bool, count int, err error)
+	CheckPassword(ctx context.Context, password string) (leakcheck.Result, error)
 }
 
 // Middleware implements the "hansestack leakcheck" Caddyfile directive as a
@@ -102,6 +103,30 @@ type Middleware struct {
 	// BlockStatus is the HTTP status code written when mode is "block" and
 	// a leak is confirmed. Defaults to 401.
 	BlockStatus int `json:"block_status,omitempty"`
+
+	// Timeout bounds every request to the Hansestack Leak-Check API,
+	// including connection setup, TLS handshake, and response body read.
+	// Accepts any duration string understood by caddy.ParseDuration (e.g.
+	// "500ms"). Empty (the default) leaves hansestack-go's own
+	// leakcheck.DefaultTimeout (500ms) in place, which is deliberately
+	// aggressive: a leak check must never become a latency bottleneck in a
+	// sign-up, login or password-change flow.
+	Timeout string `json:"timeout,omitempty"`
+
+	// CircuitBreakerThreshold is the number of consecutive check failures
+	// (timeouts, connection errors, 5xx, 429) after which the underlying
+	// hansestack-go client stops sending requests and fails open
+	// immediately, until CircuitBreakerCooldown has elapsed. Zero (the
+	// default) disables the circuit breaker entirely, matching
+	// hansestack-go's own default.
+	CircuitBreakerThreshold int `json:"circuit_breaker_threshold,omitempty"`
+
+	// CircuitBreakerCooldown is how long the circuit stays open before a
+	// single probe request is let through again. Accepts any duration
+	// string understood by caddy.ParseDuration (e.g. "30s"). Only takes
+	// effect if CircuitBreakerThreshold is set; if left empty in that case,
+	// hansestack-go's DefaultBreakerCooldown applies.
+	CircuitBreakerCooldown string `json:"circuit_breaker_cooldown,omitempty"`
 
 	logger  *zap.Logger
 	checker passwordChecker
@@ -144,10 +169,47 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	// output instead of being discarded.
 	slogLogger := slog.New(zapslog.NewHandler(m.logger.Core(), zapslog.WithName("hansestack.leakcheck")))
 
-	m.checker = leakcheck.NewClient(m.APIKey, leakcheck.WithLogger(slogLogger))
+	opts := []leakcheck.Option{leakcheck.WithLogger(slogLogger)}
+
+	if m.Timeout != "" {
+		timeout, err := m.parseDuration("timeout", m.Timeout)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, leakcheck.WithTimeout(timeout))
+	}
+
+	if m.CircuitBreakerThreshold > 0 {
+		cooldown, err := m.parseDuration("circuit_breaker_cooldown", m.CircuitBreakerCooldown)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, leakcheck.WithCircuitBreaker(m.CircuitBreakerThreshold, cooldown))
+	}
+
+	m.checker = leakcheck.NewClient(m.APIKey, opts...)
 	m.metrics = newMetrics(ctx)
 
 	return nil
+}
+
+// parseDuration parses a duration-valued field, if set, using
+// caddy.ParseDuration. An empty raw value is not an error: it simply
+// returns the zero Duration, which both leakcheck.WithTimeout (ignored,
+// falls back to leakcheck.DefaultTimeout) and leakcheck.WithCircuitBreaker
+// (falls back to leakcheck.DefaultBreakerCooldown) already treat as "use the
+// library default".
+func (m *Middleware) parseDuration(field, raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+
+	d, err := caddy.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("hansestack: invalid %s %q: %w", field, raw, err)
+	}
+
+	return d, nil
 }
 
 // Validate ensures the configuration is usable.
@@ -167,6 +229,22 @@ func (m *Middleware) Validate() error {
 		return fmt.Errorf("hansestack: invalid block_status %d", m.BlockStatus)
 	}
 
+	if m.Timeout != "" {
+		if _, err := caddy.ParseDuration(m.Timeout); err != nil {
+			return fmt.Errorf("hansestack: invalid timeout %q: %w", m.Timeout, err)
+		}
+	}
+
+	if m.CircuitBreakerThreshold < 0 {
+		return fmt.Errorf("hansestack: invalid circuit_breaker_threshold %d", m.CircuitBreakerThreshold)
+	}
+
+	if m.CircuitBreakerCooldown != "" {
+		if _, err := caddy.ParseDuration(m.CircuitBreakerCooldown); err != nil {
+			return fmt.Errorf("hansestack: invalid circuit_breaker_cooldown %q: %w", m.CircuitBreakerCooldown, err)
+		}
+	}
+
 	return nil
 }
 
@@ -175,6 +253,13 @@ func (m *Middleware) Validate() error {
 type leakResult struct {
 	leaked bool
 	count  int
+
+	// outcome reports whether the check actually reached the API, and if
+	// not, why — see leakcheck.Outcome. Under fail-open, a skipped check
+	// and a clean miss both report leaked == false with a nil error, so
+	// this is the only signal that distinguishes "confirmed not leaked"
+	// from "the check didn't run" (timeout, rate limit, circuit open, ...).
+	outcome leakcheck.Outcome
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
@@ -209,8 +294,16 @@ func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 // by the checker is logged and treated as "not leaked", exactly as mandated
 // by the hansestack-go fail-open contract. The request's context is passed
 // through unmodified.
+//
+// Under the default fail-open configuration this middleware always uses,
+// hansestack-go itself never returns a non-nil error: a skipped check
+// (timeout, rate limit, circuit open, upstream fault, ...) is reported as
+// Result{Outcome: <skip reason>} with a nil error. result.Outcome is the
+// only signal that distinguishes such a skip from a genuine "checked, not
+// leaked" — it is propagated into leakResult and surfaced both as the
+// check_outcomes_total metric and, where applicable, in logs.
 func (m *Middleware) check(r *http.Request, password string) leakResult {
-	leaked, count, err := m.checker.CheckPassword(r.Context(), password)
+	result, err := m.checker.CheckPassword(r.Context(), password)
 	if err != nil {
 		// Only reachable if the client were configured with WithFailClose,
 		// which this middleware never does. Handled defensively anyway per
@@ -221,14 +314,24 @@ func (m *Middleware) check(r *http.Request, password string) leakResult {
 			zap.String("path", r.URL.Path),
 		)
 
-		res := leakResult{leaked: false, count: 0}
+		res := leakResult{leaked: false, count: 0, outcome: leakcheck.OutcomeSkippedError}
 		m.metrics.observe(res, err)
 
 		return res
 	}
 
-	res := leakResult{leaked: leaked, count: count}
+	res := leakResult{leaked: result.Leaked, count: result.Count, outcome: result.Outcome}
 	m.metrics.observe(res, nil)
+
+	if !res.outcome.Checked() {
+		// The check was skipped rather than answered: log the reason so
+		// operators can distinguish "confirmed not leaked" from "we don't
+		// actually know" without having to correlate against metrics.
+		m.logger.Warn("hansestack: leak check skipped, failing open",
+			zap.String("outcome", res.outcome.String()),
+			zap.String("path", r.URL.Path),
+		)
+	}
 
 	return res
 }
