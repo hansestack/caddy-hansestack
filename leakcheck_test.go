@@ -794,9 +794,9 @@ func TestValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "missing api_key",
+			name:    "missing api_key is allowed (on-prem/sidecar deployments may run without auth)",
 			m:       &Middleware{Mode: ModeEnrichRequest, BlockStatus: 401},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name:    "invalid mode",
