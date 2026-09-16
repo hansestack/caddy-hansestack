@@ -42,7 +42,10 @@ so operators see it, but end users are never affected.
 ## Requirements
 
 - Go 1.22+ (for building from source)
-- A Hansestack API key ([hansestack.de](https://hansestack.de))
+- A Hansestack API key ([hansestack.de](https://hansestack.de)) — only
+  required when using the public Hansestack SaaS API. If you point `endpoint`
+  at a trusted self-hosted/on-premise deployment (e.g. a sidecar) running
+  with authentication disabled, `api_key` can be omitted entirely.
 
 ## Installation
 
@@ -98,6 +101,8 @@ hansestack leakcheck {
     # public Hansestack SaaS endpoint.
     endpoint "http://localhost:8081"
 
+    # Required for the public SaaS API. Optional if endpoint above points at
+    # a trusted on-premise/sidecar deployment running with auth disabled.
     api_key {$HANSESTACK_API_KEY}
     mode enrich_response        # modes: enrich_request | enrich_response | block (default: enrich_request)
     password_field "password"   # key in JSON or form-data (default: "password")
@@ -116,7 +121,7 @@ hansestack leakcheck {
 | Directive                    | Default                    | Description                                                             |
 | ---------------------------- | -------------------------- | ------------------------------------------------------------------------|
 | `endpoint`                   | *(public SaaS API)*         | Overrides the Hansestack API base URL. Point it at a self-hosted/on-premise deployment — e.g. a sidecar container in the same Kubernetes Pod — for data sovereignty or to avoid egress bandwidth limits. Leave unset to use the public SaaS endpoint. |
-| `api_key`                    | *(required)*                | Your Hansestack API key. Use `{$ENV_VAR}` to inject it via environment. |
+| `api_key`                    | *(required for public SaaS)* | Your Hansestack API key. Use `{$ENV_VAR}` to inject it via environment. Optional when `endpoint` points at a trusted self-hosted/on-premise deployment (e.g. a sidecar) running with authentication disabled — hansestack-go omits the API key header entirely in that case rather than sending it empty. |
 | `mode`                       | `enrich_request`            | One of `enrich_request`, `enrich_response`, `block`.                    |
 | `password_field`             | `password`                  | JSON key / form field name that carries the plaintext password.        |
 | `header_leaked`              | `X-Hansestack-Leaked`       | Header set to `true`/`false` once the check completes.                 |

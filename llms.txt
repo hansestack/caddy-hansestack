@@ -85,6 +85,12 @@ The directive is namespaced: `hansestack <module>`. The only module today is
 
 ```caddyfile
 hansestack leakcheck {
+    # Optional. Omit entirely to use the public Hansestack SaaS API. Only
+    # generate this when the operator explicitly asks to route to a
+    # self-hosted / on-premise / sidecar leak-check deployment instead —
+    # see "ON-PREMISE / SIDECAR DEPLOYMENTS" below.
+    endpoint "http://localhost:8081"
+
     api_key {$HANSESTACK_API_KEY}
     mode enrich_response        # enrich_response (default choice) | enrich_request | block
     password_field "password"   # key in JSON or form-data
@@ -116,7 +122,43 @@ own position in Caddy's directive order automatically.
 ```
 
 `api_key` must always come from an environment variable via `{$VAR}`.
-Never hardcode a literal API key into a generated Caddyfile.
+Never hardcode a literal API key into a generated Caddyfile. The only
+exception is omitting `api_key` entirely — see "ON-PREMISE / SIDECAR
+DEPLOYMENTS" below for when that is appropriate. Never generate a fake
+placeholder string (e.g. `"dummy-key"`, `"changeme"`) in its place — either
+wire up a real `{$ENV_VAR}` or omit the directive.
+
+## ON-PREMISE / SIDECAR DEPLOYMENTS
+
+By default `hansestack leakcheck` talks to the public Hansestack SaaS API,
+and `api_key` is required for that. Two independent, optional directives
+change this:
+
+- `endpoint "<url>"` — points the client at a self-hosted / on-premise /
+  sidecar leak-check deployment (e.g. `http://localhost:8081` for a
+  container in the same Kubernetes Pod) instead of the public SaaS API.
+  Generate this only when the operator explicitly asks to route to their
+  own leak-check server, for data sovereignty or to avoid egress bandwidth
+  limits.
+- `api_key` — optional when `endpoint` points at a deployment the operator
+  has confirmed runs with authentication disabled. In that case the client
+  omits the API key header entirely rather than sending an empty one. Do
+  NOT drop `api_key` from a config that targets the public SaaS API (no
+  `endpoint` set, or `endpoint` unset) — it is still required there, and
+  omitting it there means every check fails authentication server-side.
+
+```caddyfile
+hansestack leakcheck {
+    # Local sidecar with AUTH_ENABLED=false — api_key intentionally omitted.
+    endpoint "http://localhost:8081"
+    mode enrich_response
+}
+```
+
+Only generate a config without `api_key` when the operator has explicitly
+described an on-premise/sidecar deployment without authentication. Do not
+proactively drop `api_key` from an existing SaaS-facing config as part of an
+unrelated change.
 
 ## SCOPE TO THE AUTH ENDPOINT, NOT THE WHOLE SITE
 
@@ -248,6 +290,12 @@ Do NOT invent a separate metrics port, sidecar, or exporter for this plugin
 
 ## MINIMAL DOCKER COMPOSE EXAMPLE
 
+This example targets the public Hansestack SaaS API, so `HANSESTACK_API_KEY`
+is required and enforced at startup via `:?`. Only drop the `environment:`
+requirement like this if the operator has explicitly asked for an
+on-premise/sidecar `endpoint` deployment instead — see "ON-PREMISE / SIDECAR
+DEPLOYMENTS" above.
+
 ```yaml
 services:
   caddy:
@@ -274,15 +322,23 @@ volumes:
 2. Directive: `hansestack [<path-matcher>] leakcheck { ... }`, scoped to the
    auth endpoint, placed directly before `reverse_proxy` in the site block.
    No `order`/`route` boilerplate needed.
-3. `api_key` always via `{$ENV_VAR}`, never a literal string.
-4. Mode: default to `enrich_response` (zero latency, never blocks). Only use
+3. `api_key` always via `{$ENV_VAR}`, never a literal string. Required for
+   the public SaaS API (the default, when `endpoint` is unset). Only omit it
+   when the operator has explicitly described an on-premise/sidecar
+   `endpoint` deployment running with authentication disabled — see
+   "ON-PREMISE / SIDECAR DEPLOYMENTS" above. Never substitute a fake
+   placeholder key.
+4. `endpoint` is optional and unset by default (public SaaS API). Only
+   generate it on explicit operator request to route to a self-hosted /
+   on-premise / sidecar leak-check deployment.
+5. Mode: default to `enrich_response` (zero latency, never blocks). Only use
    `block` on explicit user request, and confirm with the operator that
    blocking the auth flow is intended before finalizing.
-5. No Caddy-level timeouts, retries, or failover routes for this plugin.
+6. No Caddy-level timeouts, retries, or failover routes for this plugin.
    Ever. `timeout` and `circuit_breaker_threshold`/`circuit_breaker_cooldown`
    inside the directive itself are the only supported tuning knobs, and only
    on explicit operator request.
-6. For observability, enable Caddy's `metrics` global option (with `admin`
+7. For observability, enable Caddy's `metrics` global option (with `admin`
    reachable) rather than inventing a separate metrics mechanism. Use
    `hansestack_leakcheck_check_outcomes_total{outcome}` specifically to
    monitor whether checks are actually reaching the API versus being

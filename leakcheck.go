@@ -79,7 +79,11 @@ type passwordChecker interface {
 // Caddy HTTP middleware module (http.handlers.hansestack).
 type Middleware struct {
 	// APIKey is the Hansestack API key used to authenticate against the
-	// Leak-Check API. Required.
+	// Leak-Check API. Required when talking to the public Hansestack SaaS
+	// API. It may be left empty when Endpoint points at a trusted
+	// self-hosted/on-premise deployment (e.g. a sidecar) that runs with
+	// authentication disabled — hansestack-go simply omits the API key
+	// header in that case, rather than sending it empty.
 	APIKey string `json:"api_key,omitempty"`
 
 	// Endpoint overrides the Hansestack Leak-Check API base URL used by
@@ -226,11 +230,15 @@ func (m *Middleware) parseDuration(field, raw string) (time.Duration, error) {
 }
 
 // Validate ensures the configuration is usable.
+//
+// APIKey is deliberately not validated here: hansestack-go's client accepts
+// an empty API key as a supported configuration, for a trusted on-premise
+// or sidecar Endpoint deployment running with authentication disabled. Against
+// the public SaaS endpoint (the default when Endpoint is unset) an empty key
+// is rejected server-side per request, which the fail-open contract already
+// turns into a logged, non-fatal "not leaked" outcome rather than a hard
+// provisioning error.
 func (m *Middleware) Validate() error {
-	if m.APIKey == "" {
-		return fmt.Errorf("hansestack: api_key must be set")
-	}
-
 	switch m.Mode {
 	case ModeEnrichRequest, ModeEnrichResponse, ModeBlock:
 	default:
