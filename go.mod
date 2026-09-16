@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.4
-	github.com/hansestack/hansestack-go v0.2.0
+	github.com/hansestack/hansestack-go v0.3.0
 	github.com/prometheus/client_golang v1.24.1
 	go.uber.org/zap v1.28.0
 	go.uber.org/zap/exp v0.3.0

@@ -28,6 +28,7 @@ func init() {
 // only one.
 //
 //	hansestack leakcheck {
+//	    endpoint "http://localhost:8081"
 //	    api_key {$HANSESTACK_API_KEY}
 //	    mode enrich_response
 //	    password_field "password"
@@ -71,6 +72,12 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 	for d.NextBlock(0) {
 		switch d.Val() {
+		case "endpoint":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.Endpoint = d.Val()
+
 		case "api_key":
 			if !d.NextArg() {
 				return d.ArgErr()

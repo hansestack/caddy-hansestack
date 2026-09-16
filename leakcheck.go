@@ -82,6 +82,15 @@ type Middleware struct {
 	// Leak-Check API. Required.
 	APIKey string `json:"api_key,omitempty"`
 
+	// Endpoint overrides the Hansestack Leak-Check API base URL used by
+	// the underlying hansestack-go client. Useful for routing traffic to
+	// a self-hosted/on-premise deployment — for example a sidecar
+	// container running alongside your app in the same Kubernetes Pod —
+	// instead of the public SaaS API, for data sovereignty or to avoid
+	// egress bandwidth limits. Empty (the default) leaves hansestack-go's
+	// own public SaaS endpoint in place.
+	Endpoint string `json:"endpoint,omitempty"`
+
 	// Mode selects one of "enrich_request", "enrich_response", or "block".
 	// Defaults to "enrich_request".
 	Mode string `json:"mode,omitempty"`
@@ -170,6 +179,10 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	slogLogger := slog.New(zapslog.NewHandler(m.logger.Core(), zapslog.WithName("hansestack.leakcheck")))
 
 	opts := []leakcheck.Option{leakcheck.WithLogger(slogLogger)}
+
+	if m.Endpoint != "" {
+		opts = append(opts, leakcheck.WithEndpoint(m.Endpoint))
+	}
 
 	if m.Timeout != "" {
 		timeout, err := m.parseDuration("timeout", m.Timeout)

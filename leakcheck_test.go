@@ -743,6 +743,21 @@ func TestUnmarshalCaddyfile_InvalidCircuitBreakerThreshold(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfile_Endpoint(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`leakcheck {
+		api_key supersecret
+		endpoint "http://localhost:8081"
+	}`)
+	d.Next()
+	m := new(Middleware)
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile returned error: %v", err)
+	}
+	if m.Endpoint != "http://localhost:8081" {
+		t.Errorf("Endpoint = %q, want %q", m.Endpoint, "http://localhost:8081")
+	}
+}
+
 func TestUnmarshalCaddyfile_UnknownDirective(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`leakcheck {
 		totally_unknown foo

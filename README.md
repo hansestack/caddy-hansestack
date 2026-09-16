@@ -93,6 +93,11 @@ the response.
 
 ```caddyfile
 hansestack leakcheck {
+    # Optional: route traffic to a self-hosted/on-premise deployment (e.g. a
+    # local sidecar) instead of the public SaaS API. Leave unset to use the
+    # public Hansestack SaaS endpoint.
+    endpoint "http://localhost:8081"
+
     api_key {$HANSESTACK_API_KEY}
     mode enrich_response        # modes: enrich_request | enrich_response | block (default: enrich_request)
     password_field "password"   # key in JSON or form-data (default: "password")
@@ -110,6 +115,7 @@ hansestack leakcheck {
 
 | Directive                    | Default                    | Description                                                             |
 | ---------------------------- | -------------------------- | ------------------------------------------------------------------------|
+| `endpoint`                   | *(public SaaS API)*         | Overrides the Hansestack API base URL. Point it at a self-hosted/on-premise deployment — e.g. a sidecar container in the same Kubernetes Pod — for data sovereignty or to avoid egress bandwidth limits. Leave unset to use the public SaaS endpoint. |
 | `api_key`                    | *(required)*                | Your Hansestack API key. Use `{$ENV_VAR}` to inject it via environment. |
 | `mode`                       | `enrich_request`            | One of `enrich_request`, `enrich_response`, `block`.                    |
 | `password_field`             | `password`                  | JSON key / form field name that carries the plaintext password.        |
