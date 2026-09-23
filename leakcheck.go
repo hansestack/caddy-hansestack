@@ -205,16 +205,17 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		opts = append(opts, leakcheck.WithCircuitBreaker(m.CircuitBreakerThreshold, cooldown))
 	}
 
-	// Solide Enterprise Defaults, ohne den Kunden im Caddyfile zu nerven
+	// Enterprise-grade HTTP transport defaults optimized for high-throughput
+	// connection pooling and minimal latency, especially in sidecar deployments.
 	customTransport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second, // Schnellerer Timeout für lokale Verbindungen
+			Timeout:   10 * time.Second, // Aggressive timeout optimized for local loopback connections
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          500,
-		MaxIdleConnsPerHost:   100,
+		MaxIdleConnsPerHost:   100, // Prevents socket exhaustion during "Thundering Herd" spikes
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
