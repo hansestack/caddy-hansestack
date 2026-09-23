@@ -12,6 +12,13 @@
 	# Exposes this plugin's hansestack_leakcheck_* Prometheus counters (and
 	# Caddy's own caddy_http_* metrics) on the admin API's /metrics endpoint.
 	metrics
+
+	# Suppress standard info/startup logs to save CPU cycles and disk I/O 
+	# during high-throughput operations (e.g., >10k RPS). Only critical 
+	# system and proxy errors will be logged.
+	log {
+		level ERROR
+	}
 }
 
 :80 {
