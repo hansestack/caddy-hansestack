@@ -25,6 +25,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -203,6 +204,28 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		}
 		opts = append(opts, leakcheck.WithCircuitBreaker(m.CircuitBreakerThreshold, cooldown))
 	}
+
+	// Enterprise-grade HTTP transport defaults optimized for high-throughput
+	// connection pooling and minimal latency, especially in sidecar deployments.
+	customTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second, // Aggressive timeout optimized for local loopback connections
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          500,
+		MaxIdleConnsPerHost:   100, // Prevents socket exhaustion during "Thundering Herd" spikes
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	customClient := &http.Client{
+		Transport: customTransport,
+	}
+
+	opts = append(opts, leakcheck.WithHTTPClient(customClient))
 
 	m.checker = leakcheck.NewClient(m.APIKey, opts...)
 	m.metrics = newMetrics(ctx)
