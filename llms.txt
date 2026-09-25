@@ -105,6 +105,7 @@ hansestack leakcheck {
     timeout 500ms                        # default: 500ms
     circuit_breaker_threshold 5          # default: disabled (0)
     circuit_breaker_cooldown 30s         # default: 30s
+    max_idle_conns 200                   # default: 200
 }
 ```
 
@@ -211,10 +212,11 @@ intent explicit.
 Fail-open behavior itself (never letting a slow/unreachable API block a
 login) is implemented in Go, inside the plugin's underlying `hansestack-go`
 client, and is NOT a configuration concern. Do not invent Caddyfile-level
-workarounds for it. The plugin DOES expose two narrow, optional tuning knobs
-— `timeout` and `circuit_breaker_threshold`/`circuit_breaker_cooldown` — but
-these only change *how fast* a fail-open skip happens, never whether it
-fails open at all; only generate them on explicit operator request, never
+workarounds for it. The plugin DOES expose a few narrow, optional tuning
+knobs — `timeout`, `circuit_breaker_threshold`/`circuit_breaker_cooldown`,
+and `max_idle_conns` — but these only change *how fast* a fail-open skip
+happens or how the HTTP connection pool is sized, never whether it fails
+open at all; only generate them on explicit operator request, never
 proactively.
 
 WRONG — do not add retry/backoff/failover logic to the Caddyfile:
@@ -335,9 +337,9 @@ volumes:
    `block` on explicit user request, and confirm with the operator that
    blocking the auth flow is intended before finalizing.
 6. No Caddy-level timeouts, retries, or failover routes for this plugin.
-   Ever. `timeout` and `circuit_breaker_threshold`/`circuit_breaker_cooldown`
-   inside the directive itself are the only supported tuning knobs, and only
-   on explicit operator request.
+   Ever. `timeout`, `circuit_breaker_threshold`/`circuit_breaker_cooldown`,
+   and `max_idle_conns` inside the directive itself are the only supported
+   tuning knobs, and only on explicit operator request.
 7. For observability, enable Caddy's `metrics` global option (with `admin`
    reachable) rather than inventing a separate metrics mechanism. Use
    `hansestack_leakcheck_check_outcomes_total{outcome}` specifically to
