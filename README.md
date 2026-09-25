@@ -115,6 +115,7 @@ hansestack leakcheck {
     timeout 500ms                        # per-request timeout (default: 500ms)
     circuit_breaker_threshold 5          # consecutive failures before tripping (default: disabled)
     circuit_breaker_cooldown 30s         # how long the circuit stays open (default: 30s)
+    max_idle_conns 200                   # idle connection pool size (default: 200)
 }
 ```
 
@@ -130,6 +131,7 @@ hansestack leakcheck {
 | `timeout`                    | `500ms`                     | Per-request timeout against the Leak-Check API (any Caddy duration string, e.g. `500ms`, `1s`). A leak check must never become a latency bottleneck in an auth flow, so keep this small. |
 | `circuit_breaker_threshold`  | *(disabled)*                 | Number of consecutive check failures (timeouts, connection errors, 5xx, 429) after which the client stops sending requests and fails open immediately until the cooldown elapses. `0` or unset disables the breaker. |
 | `circuit_breaker_cooldown`   | `30s`                        | How long the circuit stays open before a single probe request is let through again. Only takes effect if `circuit_breaker_threshold` is set. |
+| `max_idle_conns`             | `200`                        | Caps the underlying HTTP transport's idle (keep-alive) connection pool — applied to both `MaxIdleConns` and `MaxIdleConnsPerHost`, since there is normally only one upstream (the SaaS API or a sidecar). Prevents TCP socket exhaustion under massive load spikes without touching OS `ulimit` settings. |
 
 Both `timeout` and the circuit breaker only ever change *how fast* a fail-open
 skip happens — they never turn a skip into a rejected request. See

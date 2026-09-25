@@ -43,6 +43,7 @@
 		timeout {$HANSESTACK_TIMEOUT:500ms}
 		circuit_breaker_threshold {$HANSESTACK_CIRCUIT_BREAKER_THRESHOLD:0}
 		circuit_breaker_cooldown {$HANSESTACK_CIRCUIT_BREAKER_COOLDOWN:30s}
+		max_idle_conns {$HANSESTACK_MAX_IDLE_CONNS:200}
 	}
 
 	reverse_proxy dummy-backend:80

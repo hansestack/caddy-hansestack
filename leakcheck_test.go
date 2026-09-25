@@ -743,6 +743,33 @@ func TestUnmarshalCaddyfile_InvalidCircuitBreakerThreshold(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfile_MaxIdleConns(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`leakcheck {
+		api_key supersecret
+		max_idle_conns 200
+	}`)
+	d.Next()
+	m := new(Middleware)
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile returned error: %v", err)
+	}
+	if m.MaxIdleConns != 200 {
+		t.Errorf("MaxIdleConns = %d, want 200", m.MaxIdleConns)
+	}
+}
+
+func TestUnmarshalCaddyfile_InvalidMaxIdleConns(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`leakcheck {
+		api_key supersecret
+		max_idle_conns not-a-number
+	}`)
+	d.Next()
+	m := new(Middleware)
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected an error for a non-numeric max_idle_conns")
+	}
+}
+
 func TestUnmarshalCaddyfile_Endpoint(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`leakcheck {
 		api_key supersecret
@@ -831,6 +858,16 @@ func TestValidate(t *testing.T) {
 		{
 			name:    "invalid circuit_breaker_cooldown",
 			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 401, CircuitBreakerThreshold: 5, CircuitBreakerCooldown: "not-a-duration"},
+			wantErr: true,
+		},
+		{
+			name:    "valid max_idle_conns",
+			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 401, MaxIdleConns: 200},
+			wantErr: false,
+		},
+		{
+			name:    "negative max_idle_conns",
+			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 401, MaxIdleConns: -1},
 			wantErr: true,
 		},
 	}

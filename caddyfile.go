@@ -38,6 +38,7 @@ func init() {
 //	    timeout 500ms
 //	    circuit_breaker_threshold 5
 //	    circuit_breaker_cooldown 30s
+//	    max_idle_conns 200
 //	}
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	d := h.Dispenser
@@ -139,6 +140,16 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			m.CircuitBreakerCooldown = d.Val()
+
+		case "max_idle_conns":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			maxIdleConns, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("invalid max_idle_conns %q: %v", d.Val(), err)
+			}
+			m.MaxIdleConns = maxIdleConns
 
 		default:
 			return d.Errf("unrecognized hansestack leakcheck subdirective %q", d.Val())

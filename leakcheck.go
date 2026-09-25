@@ -60,6 +60,11 @@ const (
 	defaultHeaderCount   = "X-Hansestack-Leak-Count"
 	defaultBlockStatus   = http.StatusUnauthorized
 
+	// defaultMaxIdleConns is applied to both MaxIdleConns and
+	// MaxIdleConnsPerHost on the underlying http.Transport whenever
+	// MaxIdleConns is left unset (zero) in the Caddyfile/JSON config.
+	defaultMaxIdleConns = 200
+
 	// maxBodyBytes bounds how much of the request body the middleware will
 	// ever read while looking for the password field. This protects against
 	// memory-exhaustion / slow-body DoS attempts; it does not affect the
@@ -142,6 +147,14 @@ type Middleware struct {
 	// hansestack-go's DefaultBreakerCooldown applies.
 	CircuitBreakerCooldown string `json:"circuit_breaker_cooldown,omitempty"`
 
+	// MaxIdleConns bounds the total number of idle (keep-alive) connections
+	// the underlying http.Transport maintains, and is also applied to
+	// MaxIdleConnsPerHost so that a single upstream (the common case: one
+	// SaaS endpoint or one sidecar) can actually use the full pool. This
+	// caps TCP socket growth under load spikes without touching OS ulimit
+	// settings. Zero (the default) falls back to defaultMaxIdleConns (200).
+	MaxIdleConns int `json:"max_idle_conns,omitempty"`
+
 	logger  *zap.Logger
 	checker passwordChecker
 	metrics *metrics
@@ -175,6 +188,9 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	}
 	if m.BlockStatus == 0 {
 		m.BlockStatus = defaultBlockStatus
+	}
+	if m.MaxIdleConns == 0 {
+		m.MaxIdleConns = defaultMaxIdleConns
 	}
 
 	// Bridge Caddy's native *zap.Logger into the *slog.Logger expected by
@@ -213,9 +229,13 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 			Timeout:   10 * time.Second, // Aggressive timeout optimized for local loopback connections
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          500,
-		MaxIdleConnsPerHost:   100, // Prevents socket exhaustion during "Thundering Herd" spikes
+		ForceAttemptHTTP2: true,
+		// MaxIdleConns/MaxIdleConnsPerHost are both driven by the configured
+		// (or defaulted) MaxIdleConns so a single upstream can use the full
+		// pool, preventing socket exhaustion during "Thundering Herd" spikes
+		// without violating default OS ulimit settings.
+		MaxIdleConns:          m.MaxIdleConns,
+		MaxIdleConnsPerHost:   m.MaxIdleConns,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -287,6 +307,10 @@ func (m *Middleware) Validate() error {
 		if _, err := caddy.ParseDuration(m.CircuitBreakerCooldown); err != nil {
 			return fmt.Errorf("hansestack: invalid circuit_breaker_cooldown %q: %w", m.CircuitBreakerCooldown, err)
 		}
+	}
+
+	if m.MaxIdleConns < 0 {
+		return fmt.Errorf("hansestack: invalid max_idle_conns %d", m.MaxIdleConns)
 	}
 
 	return nil
