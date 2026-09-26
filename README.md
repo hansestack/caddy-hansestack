@@ -22,9 +22,10 @@ a client library, call an API, or change a single line of code.
    whether that password is known to be leaked, using k-anonymity so the
    plaintext password never leaves your infrastructure's process boundary
    in identifiable form.
-3. Depending on the configured `mode`, it either enriches the outgoing
-   request headers, enriches the response headers, or blocks the request
-   outright with a 4xx.
+3. Depending on the configured `mode`, it either records the result purely
+   for metrics (`observe`), enriches the outgoing request headers
+   (`enrich_request`), enriches the response headers (`enrich_response`), or
+   blocks the request outright with a 4xx (`block`).
 
 The original request body is always restored byte-for-byte before your
 backend sees it — the plugin only *observes* the password field, it never
@@ -104,7 +105,7 @@ hansestack leakcheck {
     # Required for the public SaaS API. Optional if endpoint above points at
     # a trusted on-premise/sidecar deployment running with auth disabled.
     api_key {$HANSESTACK_API_KEY}
-    mode enrich_response        # modes: enrich_request | enrich_response | block (default: enrich_request)
+    mode enrich_response        # modes: observe | enrich_request | enrich_response | block (default: enrich_request)
     password_field "password"   # key in JSON or form-data (default: "password")
     header_leaked "X-Hansestack-Leaked"       # (default)
     header_count "X-Hansestack-Leak-Count"    # (default)
@@ -123,7 +124,7 @@ hansestack leakcheck {
 | ---------------------------- | -------------------------- | ------------------------------------------------------------------------|
 | `endpoint`                   | *(public SaaS API)*         | Overrides the Hansestack API base URL. Point it at a self-hosted/on-premise deployment — e.g. a sidecar container in the same Kubernetes Pod — for data sovereignty or to avoid egress bandwidth limits. Leave unset to use the public SaaS endpoint. |
 | `api_key`                    | *(required for public SaaS)* | Your Hansestack API key. Use `{$ENV_VAR}` to inject it via environment. Optional when `endpoint` points at a trusted self-hosted/on-premise deployment (e.g. a sidecar) running with authentication disabled — hansestack-go omits the API key header entirely in that case rather than sending it empty. |
-| `mode`                       | `enrich_request`            | One of `enrich_request`, `enrich_response`, `block`.                    |
+| `mode`                       | `enrich_request`            | One of `observe`, `enrich_request`, `enrich_response`, `block`.         |
 | `password_field`             | `password`                  | JSON key / form field name that carries the plaintext password.        |
 | `header_leaked`              | `X-Hansestack-Leaked`       | Header set to `true`/`false` once the check completes.                 |
 | `header_count`               | `X-Hansestack-Leak-Count`   | Header set to the number of breaches the password was found in.        |
@@ -182,8 +183,28 @@ route {
 latency. Reach for `block` only when you have explicitly decided that your
 auth flow must reject known-leaked passwords outright; that is a product
 decision your team should make on purpose, not a side effect of installing
-this plugin.
+this plugin. Reach for `observe` when you want the Indicator-of-Compromise
+correlation signal described in [Metrics](#metrics) below without touching
+the request or response at all.
 
+Every mode captures the backend's final HTTP response status code (bucketed
+into `2xx`/`3xx`/`4xx`/`5xx`) for the `hansestack_leakcheck_responses_total`
+correlation metric — see [Metrics](#metrics) below — regardless of whether
+that mode also injects headers. This adds no behavioral change and
+negligible overhead: the response is wrapped only to observe the status
+Caddy or your backend was already going to write, never to buffer or alter
+the body, and the interfaces reverse proxies rely on
+(`http.Hijacker`/`http.Flusher`/`io.ReaderFrom` — needed for WebSockets,
+streaming, and zero-copy transfers) are fully preserved through the
+wrapper.
+
+- **`observe`** (asynchronous, headers untouched): runs the leak check the
+  same way `enrich_response` does, purely to populate
+  `hansestack_leakcheck_responses_total`, but never injects
+  `header_leaked`/`header_count` into the request or the response. Choose
+  this when you only want the correlation metric — e.g. to alert on "a
+  leaked password nonetheless produced a successful (`2xx`) login" — without
+  changing anything a client or backend can observe.
 - **`enrich_response`** (asynchronous, default-recommended): starts the leak
   check concurrently with the downstream handler chain, then blocks only the
   outgoing `WriteHeader` call — for the duration of the (500ms-bounded) API
@@ -275,6 +296,22 @@ describe a Hansestack API outcome, not an HTTP server statistic):
 | `hansestack_leakcheck_checks_total{result}`     | Counter | Total passwords checked, labeled `result="leaked"` or `result="not_leaked"`.|
 | `hansestack_leakcheck_check_outcomes_total{outcome}` | Counter | The *reasoning* behind every check, labeled `outcome="checked"`, `"skipped_timeout"`, `"skipped_rate_limited"`, `"skipped_circuit_open"`, `"skipped_error"`, or `"skipped_canceled"`. Under fail-open, a skipped check and a genuine "not leaked" both count as `result="not_leaked"` above — this metric is what tells them apart. |
 | `hansestack_leakcheck_check_errors_total`       | Counter | Total checks that fell back to fail-open because the API client errored. In the default configuration this should stay at zero; a nonzero rate signals a misconfiguration (e.g. an invalid API key) worth investigating, even though no end user was ever affected. |
+| `hansestack_leakcheck_responses_total{result,status_class}` | Counter | **Indicator-of-Compromise correlation counter.** Pairs the leak-check result with the *backend's own* final HTTP response status class. `result` is `"leaked"`, `"not_leaked"`, or `"skipped"` (any fail-open skip reason, collapsed into one bucket — see `check_outcomes_total` above for the detailed reason). `status_class` is bucketed to `"2xx"`/`"3xx"`/`"4xx"`/`"5xx"`/`"unknown"` (never a raw status code) to keep cardinality bounded regardless of what the backend returns. Recorded in every mode, including `observe`, and even if the backend panics — see below. |
+
+`hansestack_leakcheck_responses_total{result="leaked", status_class="2xx"}`
+is the single most actionable series this plugin exposes: it means a request
+carrying a password confirmed to be in a known breach nonetheless reached
+the backend and got a successful response — i.e. a leaked password was used
+to log in successfully. This is recorded in every mode, not just `block`,
+since `observe`/`enrich_request`/`enrich_response` all forward the request
+regardless of the check result.
+
+This metric is recorded via a `defer` in every mode, so an observation is
+never silently dropped — not on an early return, not if the backend panics
+(recorded as `status_class="unknown"` in that case), and not under a slow or
+canceled request. A panic downstream is always re-raised after the metric is
+recorded, so Caddy's own panic-recovery middleware still sees and handles it
+exactly as it would without this plugin.
 
 Example query — leak rate over the last 5 minutes:
 
@@ -298,6 +335,19 @@ A sustained drop below 1.0 here — especially with a rising
 Leak-Check API is degraded or unreachable; end users are unaffected (every
 mode except `block` still passes requests through, and `block` still only
 rejects on a *confirmed* leak), but the leak check itself isn't running.
+
+Example query — Indicator-of-Compromise: leaked passwords that nonetheless
+produced a successful login, over the last hour:
+
+```promql
+sum(increase(hansestack_leakcheck_responses_total{result="leaked", status_class="2xx"}[1h]))
+```
+
+A nonzero, sustained value here is worth alerting on regardless of mode:
+it means a request carrying a password confirmed to be in a known breach
+was forwarded to (or, in `enrich_request`/`enrich_response`, processed by)
+your backend and got back a `2xx` response — i.e. someone successfully
+authenticated with a known-leaked credential.
 
 ## Releasing & Versioning
 

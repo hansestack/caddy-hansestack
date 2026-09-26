@@ -111,6 +111,136 @@ func TestMetrics_DuplicateRegistrationIsReused(t *testing.T) {
 	}
 }
 
+// TestStatusClass verifies the HTTP status code bucketing used to keep
+// responsesTotal's cardinality bounded regardless of what the backend
+// returns.
+func TestStatusClass(t *testing.T) {
+	tests := []struct {
+		statusCode int
+		want       string
+	}{
+		{100, "1xx"},
+		{199, "1xx"},
+		{200, "2xx"},
+		{204, "2xx"},
+		{299, "2xx"},
+		{300, "3xx"},
+		{301, "3xx"},
+		{399, "3xx"},
+		{400, "4xx"},
+		{401, "4xx"},
+		{404, "4xx"},
+		{499, "4xx"},
+		{500, "5xx"},
+		{502, "5xx"},
+		{599, "5xx"},
+		{0, "unknown"},   // nothing was ever written (e.g. hijacked connection)
+		{99, "unknown"},  // below the valid HTTP status range
+		{600, "unknown"}, // above the valid HTTP status range
+		{-1, "unknown"},  // defensively guard against a nonsensical negative code
+	}
+
+	for _, tc := range tests {
+		if got := statusClass(tc.statusCode); got != tc.want {
+			t.Errorf("statusClass(%d) = %q, want %q", tc.statusCode, got, tc.want)
+		}
+	}
+}
+
+// TestResponseResult verifies that a skipped check (any outcome other than
+// leakcheck.OutcomeChecked) is always classified as "skipped" for
+// responsesTotal, regardless of the neutral leaked/not-leaked value it
+// carries under fail-open — conflating the two would defeat the purpose of
+// the correlation metric.
+func TestResponseResult(t *testing.T) {
+	tests := []struct {
+		name string
+		res  leakResult
+		want string
+	}{
+		{
+			name: "checked, not leaked",
+			res:  leakResult{leaked: false, outcome: leakcheck.OutcomeChecked},
+			want: responseResultNotLeaked,
+		},
+		{
+			name: "checked, leaked",
+			res:  leakResult{leaked: true, outcome: leakcheck.OutcomeChecked},
+			want: responseResultLeaked,
+		},
+		{
+			name: "skipped (timeout), neutral leaked=false must not read as not_leaked",
+			res:  leakResult{leaked: false, outcome: leakcheck.OutcomeSkippedTimeout},
+			want: responseResultSkipped,
+		},
+		{
+			name: "skipped (rate limited)",
+			res:  leakResult{leaked: false, outcome: leakcheck.OutcomeSkippedRateLimited},
+			want: responseResultSkipped,
+		},
+		{
+			name: "skipped (circuit open)",
+			res:  leakResult{leaked: false, outcome: leakcheck.OutcomeSkippedCircuitOpen},
+			want: responseResultSkipped,
+		},
+		{
+			name: "skipped (error)",
+			res:  leakResult{leaked: false, outcome: leakcheck.OutcomeSkippedError},
+			want: responseResultSkipped,
+		},
+		{
+			name: "skipped (canceled)",
+			res:  leakResult{leaked: false, outcome: leakcheck.OutcomeSkippedCanceled},
+			want: responseResultSkipped,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := responseResult(tc.res); got != tc.want {
+				t.Errorf("responseResult(%+v) = %q, want %q", tc.res, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMetrics_ObserveResponse verifies observeResponse increments
+// responsesTotal with the correct {result, status_class} label combination,
+// independently of the existing observe()/checksTotal path.
+func TestMetrics_ObserveResponse(t *testing.T) {
+	ctx := newTestContext(t)
+	m := newMetrics(ctx)
+
+	m.observeResponse(leakResult{leaked: true, outcome: leakcheck.OutcomeChecked}, http.StatusOK)
+	m.observeResponse(leakResult{leaked: false, outcome: leakcheck.OutcomeChecked}, http.StatusUnauthorized)
+	m.observeResponse(leakResult{leaked: false, outcome: leakcheck.OutcomeSkippedTimeout}, http.StatusOK)
+	m.observeResponse(leakResult{leaked: true, outcome: leakcheck.OutcomeChecked}, http.StatusOK)
+
+	cases := []struct {
+		result      string
+		statusClass string
+		want        float64
+	}{
+		{responseResultLeaked, "2xx", 2},
+		{responseResultNotLeaked, "4xx", 1},
+		{responseResultSkipped, "2xx", 1},
+	}
+
+	for _, tc := range cases {
+		if got := testutil.ToFloat64(m.responsesTotal.WithLabelValues(tc.result, tc.statusClass)); got != tc.want {
+			t.Errorf("responsesTotal{result=%s, status_class=%s} = %v, want %v", tc.result, tc.statusClass, got, tc.want)
+		}
+	}
+}
+
+// TestMetrics_ObserveResponse_NilReceiverIsSafe ensures a nil *metrics never
+// panics when observeResponse is called, mirroring the existing
+// TestMetrics_NilReceiverIsSafe guarantee for observe().
+func TestMetrics_ObserveResponse_NilReceiverIsSafe(t *testing.T) {
+	var m *metrics
+	m.observeResponse(leakResult{leaked: true}, http.StatusOK) // must not panic
+}
+
 // TestMiddleware_MetricsIntegration verifies end-to-end that ServeHTTP
 // increments the shared metrics through Middleware.check, across modes.
 func TestMiddleware_MetricsIntegration(t *testing.T) {
