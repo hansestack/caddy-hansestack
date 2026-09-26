@@ -101,8 +101,8 @@ type Middleware struct {
 	// own public SaaS endpoint in place.
 	Endpoint string `json:"endpoint,omitempty"`
 
-	// Mode selects one of "enrich_request", "enrich_response", or "block".
-	// Defaults to "enrich_request".
+	// Mode selects one of "observe", "enrich_request", "enrich_response",
+	// or "block". Defaults to "enrich_request".
 	Mode string `json:"mode,omitempty"`
 
 	// PasswordField is the JSON key or form field name that carries the
@@ -283,10 +283,10 @@ func (m *Middleware) parseDuration(field, raw string) (time.Duration, error) {
 // provisioning error.
 func (m *Middleware) Validate() error {
 	switch m.Mode {
-	case ModeEnrichRequest, ModeEnrichResponse, ModeBlock:
+	case ModeObserve, ModeEnrichRequest, ModeEnrichResponse, ModeBlock:
 	default:
-		return fmt.Errorf("hansestack: invalid mode %q (must be one of %q, %q, %q)",
-			m.Mode, ModeEnrichRequest, ModeEnrichResponse, ModeBlock)
+		return fmt.Errorf("hansestack: invalid mode %q (must be one of %q, %q, %q, %q)",
+			m.Mode, ModeObserve, ModeEnrichRequest, ModeEnrichResponse, ModeBlock)
 	}
 
 	if m.BlockStatus < 100 || m.BlockStatus > 599 {
@@ -330,14 +330,20 @@ type leakResult struct {
 	outcome leakcheck.Outcome
 }
 
-// ServeHTTP implements caddyhttp.MiddlewareHandler.
+// ServeHTTP implements caddyhttp.MiddlewareHandler. It is the single entry
+// point for all four modes; each mode-specific serve* method is responsible
+// for performing the leak check and, via a defer, guaranteeing that exactly
+// one hansestack_leakcheck_responses_total observation is recorded once the
+// backend's final HTTP status is known — including on panics or early
+// returns from the downstream handler chain.
 func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	password, found, err := extractPassword(r, m.PasswordField)
 	if err != nil {
 		// Malformed body, unsupported content type, oversized payload, or no
 		// password field present: never block the request on account of
 		// this. Log for operators and let the backend handle it as it would
-		// without this plugin installed.
+		// without this plugin installed. No leak check was attempted, so no
+		// metric of any kind is recorded for this request.
 		m.logger.Warn("hansestack: could not extract password from request, skipping check",
 			zap.Error(err),
 			zap.String("path", r.URL.Path),
@@ -349,6 +355,8 @@ func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	}
 
 	switch m.Mode {
+	case ModeObserve:
+		return m.serveObserve(w, r, next, password)
 	case ModeBlock:
 		return m.serveBlock(w, r, next, password)
 	case ModeEnrichResponse:
@@ -414,13 +422,128 @@ func (m *Middleware) setHeaders(h http.Header, res leakResult) {
 	h.Set(m.HeaderCount, fmt.Sprintf("%d", res.count))
 }
 
+// statusCapturingWriter wraps an http.ResponseWriter to record the final
+// HTTP status code written by the downstream handler chain, without
+// buffering the body or otherwise altering response behavior. It is the
+// shared primitive behind observe, enrich_request, and block's pass-through
+// path — every mode that needs to know the backend's status without
+// injecting headers into the response itself.
+//
+// It embeds caddyhttp.ResponseWriterWrapper (which in turn promotes Push,
+// ReadFrom, and Unwrap from the wrapped writer) so that Caddy's own fast
+// paths keep working transparently:
+//
+//   - Unwrap() lets http.ResponseController walk through to the real
+//     writer, which is how Hijack, SetReadDeadline, and friends are
+//     expected to be reached in modern (Go 1.20+) code — see
+//     net/http.ResponseController.
+//   - ReadFrom lets io.Copy's fast path (e.g. a reverse-proxied streaming
+//     response) avoid an intermediate buffer.
+//   - Push promotes HTTP/2 server push if the underlying writer supports
+//     it.
+//
+// Only WriteHeader and Write are overridden, and only to record the status
+// code; both are otherwise pure pass-throughs, so this wrapper adds no
+// buffering and no meaningful allocation or latency overhead beyond the
+// wrapper struct itself.
+type statusCapturingWriter struct {
+	*caddyhttp.ResponseWriterWrapper
+
+	statusCode  int
+	wroteHeader bool
+}
+
+// newStatusCapturingWriter wraps w, ready to record whatever status code the
+// downstream handler chain eventually writes.
+func newStatusCapturingWriter(w http.ResponseWriter) *statusCapturingWriter {
+	return &statusCapturingWriter{ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: w}}
+}
+
+// WriteHeader records statusCode exactly once (the first call wins, matching
+// net/http's own semantics for repeated WriteHeader calls) and forwards it
+// to the wrapped writer.
+func (sw *statusCapturingWriter) WriteHeader(statusCode int) {
+	if !sw.wroteHeader {
+		sw.statusCode = statusCode
+		sw.wroteHeader = true
+	}
+	sw.ResponseWriterWrapper.WriteHeader(statusCode)
+}
+
+// Write implicitly sends a 200 OK if WriteHeader was never called first,
+// exactly like the standard library's http.ResponseWriter — so the status
+// capture must apply the same default before delegating.
+func (sw *statusCapturingWriter) Write(b []byte) (int, error) {
+	if !sw.wroteHeader {
+		sw.WriteHeader(http.StatusOK)
+	}
+	return sw.ResponseWriterWrapper.Write(b)
+}
+
+// Status returns the final status code observed so far: whatever was
+// explicitly or implicitly written, or 0 if the downstream handler never
+// wrote anything at all (e.g. it hijacked the connection, or returned
+// without producing a response body or status).
+func (sw *statusCapturingWriter) Status() int {
+	return sw.statusCode
+}
+
+// Interface guards: statusCapturingWriter must keep promoting the fast-path
+// interfaces caddyhttp.ResponseWriterWrapper already implements, so wrapping
+// it here never regresses Hijacker/Flusher/ReaderFrom support for streaming
+// or WebSocket upgrades proxied through this middleware.
+var (
+	_ http.ResponseWriter = (*statusCapturingWriter)(nil)
+	_ io.ReaderFrom       = (*statusCapturingWriter)(nil)
+)
+
+// serveObserve performs a synchronous check purely for metrics correlation:
+// it never touches the request or the response, only wrapping w to capture
+// the backend's final status code for hansestack_leakcheck_responses_total.
+// Use this mode when the IoC correlation signal is wanted without any
+// change in behavior visible to the client or the backend.
+//
+// The deferred observation runs even if next.ServeHTTP panics: recover()
+// lets this middleware still record the correlation metric (typically with
+// status_class="unknown", since a panic mid-response usually leaves nothing
+// written) before re-panicking so Caddy's own panic-recovery middleware
+// still sees and handles the panic exactly as it would without this
+// plugin — this middleware must never swallow a downstream panic.
+func (m *Middleware) serveObserve(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, password string) error {
+	res := m.check(r, password)
+
+	sw := newStatusCapturingWriter(w)
+	defer func() {
+		rec := recover()
+		m.metrics.observeResponse(res, sw.Status())
+		if rec != nil {
+			panic(rec)
+		}
+	}()
+
+	return next.ServeHTTP(sw, r)
+}
+
 // serveEnrichRequest performs a synchronous check and injects the result as
-// request headers before invoking the next handler in the chain.
+// request headers before invoking the next handler in the chain, capturing
+// the backend's final status code for hansestack_leakcheck_responses_total.
+//
+// See serveObserve's doc comment for why the observation is wrapped in a
+// recover()/re-panic defer.
 func (m *Middleware) serveEnrichRequest(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, password string) error {
 	res := m.check(r, password)
 	m.setHeaders(r.Header, res)
 
-	return next.ServeHTTP(w, r)
+	sw := newStatusCapturingWriter(w)
+	defer func() {
+		rec := recover()
+		m.metrics.observeResponse(res, sw.Status())
+		if rec != nil {
+			panic(rec)
+		}
+	}()
+
+	return next.ServeHTTP(sw, r)
 }
 
 // serveBlock performs a synchronous check. If, and only if, the API
@@ -428,11 +551,39 @@ func (m *Middleware) serveEnrichRequest(w http.ResponseWriter, r *http.Request, 
 // block_status and a generic JSON error body; the backend is never invoked
 // in that case. In every other case (not leaked, or the check failed open)
 // the request proceeds unchanged.
+//
+// The Indicator-of-Compromise correlation metric is recorded by a single
+// deferred call at the top of the function, driven by a status variable
+// that starts at m.BlockStatus (correct for the short-circuit case, known
+// with certainty before the backend is ever invoked) and is overwritten
+// only by the pass-through branch below, once the backend's real status is
+// known. Structuring it this way — one defer, one status variable — means a
+// future early return added to either branch can never accidentally skip
+// the observation, unlike a manual call placed just before each return.
+// recover() additionally guarantees the observation still happens (with
+// whatever status was captured so far) if next.ServeHTTP panics, before
+// re-panicking so Caddy's own recovery middleware still handles it — see
+// serveObserve's doc comment for the same pattern.
 func (m *Middleware) serveBlock(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, password string) error {
 	res := m.check(r, password)
 
+	status := m.BlockStatus
+	defer func() {
+		rec := recover()
+		m.metrics.observeResponse(res, status)
+		if rec != nil {
+			panic(rec)
+		}
+	}()
+
 	if !res.leaked {
-		return next.ServeHTTP(w, r)
+		sw := newStatusCapturingWriter(w)
+		// Runs before the outer defer above (LIFO), so the outer defer
+		// always observes the backend's real status rather than the
+		// m.BlockStatus this variable was seeded with.
+		defer func() { status = sw.Status() }()
+
+		return next.ServeHTTP(sw, r)
 	}
 
 	m.logger.Info("hansestack: blocking request, password found in known breaches",
@@ -457,7 +608,16 @@ func (m *Middleware) serveBlock(w http.ResponseWriter, r *http.Request, next cad
 // handler chain. The response is wrapped so that the first call to
 // WriteHeader blocks until the check has completed, at which point the
 // enrichment headers are injected into the real response before the
-// original status code is written.
+// original status code is written and captured for
+// hansestack_leakcheck_responses_total.
+//
+// The deferred observation runs even if next.ServeHTTP panics: recover()
+// lets this middleware still finalize the wrapper (draining the leak-check
+// goroutine's result and, if the panic happened before any write, still
+// recording status_class="unknown") before re-panicking so Caddy's own
+// panic-recovery middleware still sees and handles the panic exactly as it
+// would without this plugin — see serveObserve's doc comment for the same
+// pattern.
 func (m *Middleware) serveEnrichResponse(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, password string) error {
 	resultCh := make(chan leakResult, 1)
 
@@ -466,49 +626,71 @@ func (m *Middleware) serveEnrichResponse(w http.ResponseWriter, r *http.Request,
 	}()
 
 	rw := &enrichingResponseWriter{
-		ResponseWriter: w,
-		mw:             m,
-		resultCh:       resultCh,
+		statusCapturingWriter: newStatusCapturingWriter(w),
+		mw:                    m,
+		resultCh:              resultCh,
 	}
 
-	err := next.ServeHTTP(rw, r)
+	defer func() {
+		rec := recover()
 
-	// If the downstream handler never wrote a response (e.g. it only wrote a
-	// body via an implicit 200, or nothing at all), make sure the headers
-	// are still applied and the wrapper's bookkeeping is finalized.
-	rw.ensureHeadersApplied()
+		// If the downstream handler never wrote a response (e.g. it only
+		// wrote a body via an implicit 200, wrote nothing at all, or
+		// panicked before writing anything), make sure the headers are
+		// still applied and the wrapper's bookkeeping is finalized.
+		rw.ensureHeadersApplied()
+		m.metrics.observeResponse(rw.result(), rw.Status())
 
-	return err
+		if rec != nil {
+			panic(rec)
+		}
+	}()
+
+	return next.ServeHTTP(rw, r)
 }
 
-// enrichingResponseWriter wraps http.ResponseWriter so that the Hansestack
+// enrichingResponseWriter wraps statusCapturingWriter so that the Hansestack
 // enrichment headers can be injected exactly once, immediately before
 // headers are actually sent, blocking only long enough for the concurrent
-// leak check (bounded by the Hansestack client's own timeout) to finish.
+// leak check (bounded by the Hansestack client's own timeout) to finish. It
+// also captures the backend's final status code (via the embedded
+// statusCapturingWriter) for the responses_total correlation metric.
 type enrichingResponseWriter struct {
-	http.ResponseWriter
+	*statusCapturingWriter
 
 	mw       *Middleware
 	resultCh chan leakResult
 
-	once sync.Once
+	once   sync.Once
+	resVal leakResult
 }
 
 // applyResult blocks until the leak-check goroutine has produced a result,
-// then writes the enrichment headers. It is safe to call multiple times;
-// only the first call has any effect.
+// records it for later correlation via result(), then writes the enrichment
+// headers. It is safe to call multiple times; only the first call has any
+// effect.
 func (rw *enrichingResponseWriter) applyResult() {
 	rw.once.Do(func() {
 		res := <-rw.resultCh
+		rw.resVal = res
 		rw.mw.setHeaders(rw.Header(), res)
 	})
 }
 
+// result returns the leak-check result once applyResult has run at least
+// once. serveEnrichResponse always calls ensureHeadersApplied before
+// reading this, so it is guaranteed to reflect the real result rather than
+// its zero value.
+func (rw *enrichingResponseWriter) result() leakResult {
+	return rw.resVal
+}
+
 // WriteHeader blocks until the leak-check result is available, applies the
-// enrichment headers, and then forwards to the wrapped ResponseWriter.
+// enrichment headers, and then forwards to the wrapped statusCapturingWriter
+// (which itself records the status code and forwards to the real writer).
 func (rw *enrichingResponseWriter) WriteHeader(statusCode int) {
 	rw.applyResult()
-	rw.ResponseWriter.WriteHeader(statusCode)
+	rw.statusCapturingWriter.WriteHeader(statusCode)
 }
 
 // Write ensures headers (and therefore the enrichment) are applied even if
@@ -516,7 +698,7 @@ func (rw *enrichingResponseWriter) WriteHeader(statusCode int) {
 // WriteHeader, which implicitly sends a 200 OK.
 func (rw *enrichingResponseWriter) Write(b []byte) (int, error) {
 	rw.applyResult()
-	return rw.ResponseWriter.Write(b)
+	return rw.statusCapturingWriter.Write(b)
 }
 
 // ensureHeadersApplied is called after the downstream handler has returned,

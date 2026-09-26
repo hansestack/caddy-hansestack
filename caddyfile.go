@@ -8,6 +8,20 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
+// ModeObserve is the fourth supported operation mode: an asynchronous leak
+// check that captures the backend's final HTTP response status code for
+// metrics correlation (hansestack_leakcheck_responses_total) but never
+// modifies the request or response — no headers are injected in either
+// direction. It is the mode of choice for operators who want the IoC
+// correlation signal (did a leaked-password login succeed?) without
+// changing anything the backend or client observes.
+//
+// Declared here rather than alongside ModeEnrichRequest/ModeEnrichResponse/
+// ModeBlock in leakcheck.go only because this refactor is being rolled out
+// incrementally, file by file; leakcheck.go's mode dispatch (ServeHTTP) and
+// Validate() are updated to recognize it in a subsequent step.
+const ModeObserve = "observe"
+
 func init() {
 	httpcaddyfile.RegisterHandlerDirective("hansestack", parseCaddyfile)
 
@@ -30,7 +44,7 @@ func init() {
 //	hansestack leakcheck {
 //	    endpoint "http://localhost:8081"
 //	    api_key {$HANSESTACK_API_KEY}
-//	    mode enrich_response
+//	    mode enrich_response  # or: observe | enrich_request | block
 //	    password_field "password"
 //	    header_leaked "X-Hansestack-Leaked"
 //	    header_count "X-Hansestack-Leak-Count"

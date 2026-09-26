@@ -1,10 +1,12 @@
 package caddyhansestack
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/hansestack/hansestack-go/leakcheck"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 )
 
@@ -547,6 +551,72 @@ func TestServeHTTP_EnrichResponse(t *testing.T) {
 	})
 }
 
+// TestServeHTTP_Observe verifies mode=observe: the check runs synchronously,
+// the backend is invoked unchanged, and neither the request nor the
+// response is ever modified — no enrichment headers in either direction —
+// while the check itself still happens and the backend's status is still
+// captured for the responses_total correlation metric (see
+// TestServeHTTP_ResponsesTotal for that assertion).
+func TestServeHTTP_Observe(t *testing.T) {
+	tests := []struct {
+		name    string
+		checker *fakeChecker
+	}{
+		{name: "not leaked", checker: &fakeChecker{leaked: false, count: 0}},
+		{name: "leaked", checker: &fakeChecker{leaked: true, count: 42}},
+		{name: "checker errors: fails open", checker: &fakeChecker{err: errors.New("boom")}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestMiddleware(tc.checker)
+			m.Mode = ModeObserve
+
+			r := jsonRequest(t, `{"password":"hunter2"}`)
+			w := httptest.NewRecorder()
+
+			var seenLeakedReqHeader, seenCountReqHeader string
+			nextCalled := false
+			next := nextHandler(func(w http.ResponseWriter, r *http.Request) {
+				nextCalled = true
+				seenLeakedReqHeader = r.Header.Get(defaultHeaderLeaked)
+				seenCountReqHeader = r.Header.Get(defaultHeaderCount)
+				w.WriteHeader(http.StatusTeapot)
+			})
+
+			if err := m.ServeHTTP(w, r, next); err != nil {
+				t.Fatalf("ServeHTTP returned error: %v", err)
+			}
+			if !nextCalled {
+				t.Fatal("next handler was not called")
+			}
+			if tc.checker.calls != 1 {
+				t.Errorf("checker called %d times, want 1", tc.checker.calls)
+			}
+
+			// observe must never inject headers, in either direction.
+			if seenLeakedReqHeader != "" {
+				t.Errorf("request header leaked = %q, want empty (observe must not modify the request)", seenLeakedReqHeader)
+			}
+			if seenCountReqHeader != "" {
+				t.Errorf("request header count = %q, want empty (observe must not modify the request)", seenCountReqHeader)
+			}
+			if got := w.Header().Get(defaultHeaderLeaked); got != "" {
+				t.Errorf("response header leaked = %q, want empty (observe must not modify the response)", got)
+			}
+			if got := w.Header().Get(defaultHeaderCount); got != "" {
+				t.Errorf("response header count = %q, want empty (observe must not modify the response)", got)
+			}
+
+			// The backend's real status must still reach the client
+			// unchanged.
+			if w.Code != http.StatusTeapot {
+				t.Errorf("status = %d, want %d (observe must not alter the response)", w.Code, http.StatusTeapot)
+			}
+		})
+	}
+}
+
 // TestServeHTTP_SkippedCheckStillFailsOpen verifies that a check that was
 // skipped under fail-open (e.g. timeout, rate limit, circuit open) — which
 // hansestack-go reports as Result{Outcome: <skip reason>} with a nil error,
@@ -583,7 +653,7 @@ func TestServeHTTP_SkippedCheckStillFailsOpen(t *testing.T) {
 // extractable password skip the check entirely and proceed unchanged, for
 // every mode.
 func TestServeHTTP_NoPasswordFound(t *testing.T) {
-	for _, mode := range []string{ModeEnrichRequest, ModeEnrichResponse, ModeBlock} {
+	for _, mode := range []string{ModeObserve, ModeEnrichRequest, ModeEnrichResponse, ModeBlock} {
 		t.Run(mode, func(t *testing.T) {
 			checker := &fakeChecker{leaked: true, count: 99} // must never be consulted
 			m := newTestMiddleware(checker)
@@ -636,6 +706,291 @@ func TestServeHTTP_ContextPropagation(t *testing.T) {
 
 	if checker.lastCtx == nil || checker.lastCtx.Value(ctxKey{}) != "marker" {
 		t.Error("CheckPassword was not called with the request's context")
+	}
+}
+
+// TestServeHTTP_ResponsesTotal is the end-to-end regression test for the
+// Indicator-of-Compromise correlation metric: it verifies that every mode
+// (observe, enrich_request, enrich_response, block) increments
+// hansestack_leakcheck_responses_total with the correct {result,
+// status_class} labels, derived from the backend's real (or, for a blocked
+// request, the configured block_status) response.
+func TestServeHTTP_ResponsesTotal(t *testing.T) {
+	tests := []struct {
+		name           string
+		mode           string
+		checker        *fakeChecker
+		backendStatus  int // status the fake backend writes; ignored for a blocked leak
+		wantResult     string
+		wantStatusClas string
+	}{
+		{
+			name:           "observe: not leaked, backend 200",
+			mode:           ModeObserve,
+			checker:        &fakeChecker{leaked: false},
+			backendStatus:  http.StatusOK,
+			wantResult:     responseResultNotLeaked,
+			wantStatusClas: "2xx",
+		},
+		{
+			name:           "observe: leaked, backend 200 (the core IoC signal)",
+			mode:           ModeObserve,
+			checker:        &fakeChecker{leaked: true, count: 3},
+			backendStatus:  http.StatusOK,
+			wantResult:     responseResultLeaked,
+			wantStatusClas: "2xx",
+		},
+		{
+			name:           "enrich_request: leaked, backend rejects with 401",
+			mode:           ModeEnrichRequest,
+			checker:        &fakeChecker{leaked: true, count: 1},
+			backendStatus:  http.StatusUnauthorized,
+			wantResult:     responseResultLeaked,
+			wantStatusClas: "4xx",
+		},
+		{
+			name:           "enrich_response: not leaked, backend 500",
+			mode:           ModeEnrichResponse,
+			checker:        &fakeChecker{leaked: false},
+			backendStatus:  http.StatusInternalServerError,
+			wantResult:     responseResultNotLeaked,
+			wantStatusClas: "5xx",
+		},
+		{
+			name:           "block: not leaked, passes through to backend 200",
+			mode:           ModeBlock,
+			checker:        &fakeChecker{leaked: false},
+			backendStatus:  http.StatusOK,
+			wantResult:     responseResultNotLeaked,
+			wantStatusClas: "2xx",
+		},
+		{
+			name:           "block: leaked, short-circuited with block_status, backend never runs",
+			mode:           ModeBlock,
+			checker:        &fakeChecker{leaked: true, count: 9},
+			wantResult:     responseResultLeaked,
+			wantStatusClas: "4xx", // defaultBlockStatus is 401
+		},
+		{
+			name:           "skipped check (fail-open) is labeled \"skipped\", not \"not_leaked\"",
+			mode:           ModeObserve,
+			checker:        &fakeChecker{leaked: false, outcome: leakcheck.OutcomeSkippedTimeout},
+			backendStatus:  http.StatusOK,
+			wantResult:     responseResultSkipped,
+			wantStatusClas: "2xx",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+			defer cancel()
+
+			m := newTestMiddleware(tc.checker)
+			m.Mode = tc.mode
+			m.metrics = newMetrics(ctx)
+
+			r := jsonRequest(t, `{"password":"hunter2"}`)
+			w := httptest.NewRecorder()
+			next := nextHandler(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.backendStatus)
+			})
+
+			if err := m.ServeHTTP(w, r, next); err != nil {
+				t.Fatalf("ServeHTTP returned error: %v", err)
+			}
+
+			got := testutil.ToFloat64(m.metrics.responsesTotal.WithLabelValues(tc.wantResult, tc.wantStatusClas))
+			if got != 1 {
+				t.Errorf("responses_total{result=%q, status_class=%q} = %v, want 1",
+					tc.wantResult, tc.wantStatusClas, got)
+			}
+		})
+	}
+}
+
+// hijackableRecorder is an httptest.ResponseRecorder that also implements
+// http.Hijacker, so tests can verify that statusCapturingWriter's Unwrap()
+// lets http.ResponseController reach through to it — the exact mechanism
+// reverse_proxy relies on for WebSocket/CONNECT upgrades. httptest's own
+// ResponseRecorder deliberately does not implement Hijacker, so it cannot be
+// used directly for this regression test.
+type hijackableRecorder struct {
+	*httptest.ResponseRecorder
+	hijacked bool
+}
+
+func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	server, _ := net.Pipe()
+	return server, bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server)), nil
+}
+
+// readerFromRecorder is an httptest.ResponseRecorder that also implements
+// io.ReaderFrom, so tests can verify statusCapturingWriter promotes the fast
+// streaming path (see caddyhttp.ResponseWriterWrapper.ReadFrom) rather than
+// silently falling back to a manual io.Copy.
+type readerFromRecorder struct {
+	*httptest.ResponseRecorder
+	readFromCalled bool
+}
+
+func (rf *readerFromRecorder) ReadFrom(r io.Reader) (int64, error) {
+	rf.readFromCalled = true
+	return io.Copy(rf.ResponseRecorder, r)
+}
+
+// TestStatusCapturingWriter_PreservesHijacker is a regression test for the
+// classic response-writer-wrapping pitfall: a naive wrapper that only embeds
+// http.ResponseWriter (rather than promoting Unwrap) silently breaks
+// Hijack(), which reverse_proxy needs for WebSocket/CONNECT upgrades.
+func TestStatusCapturingWriter_PreservesHijacker(t *testing.T) {
+	rec := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+	sw := newStatusCapturingWriter(rec)
+
+	conn, _, err := http.NewResponseController(sw).Hijack()
+	if err != nil {
+		t.Fatalf("Hijack() through statusCapturingWriter failed: %v", err)
+	}
+	defer conn.Close()
+
+	if !rec.hijacked {
+		t.Error("underlying Hijack() was never reached through statusCapturingWriter")
+	}
+}
+
+// TestStatusCapturingWriter_PreservesReadFrom is a regression test ensuring
+// statusCapturingWriter still promotes io.ReaderFrom from the wrapped
+// writer, so a streamed reverse-proxy response keeps its zero-copy fast
+// path instead of falling back to a manual io.Copy loop.
+func TestStatusCapturingWriter_PreservesReadFrom(t *testing.T) {
+	rec := &readerFromRecorder{ResponseRecorder: httptest.NewRecorder()}
+	sw := newStatusCapturingWriter(rec)
+
+	rf, ok := any(sw).(io.ReaderFrom)
+	if !ok {
+		t.Fatal("statusCapturingWriter does not implement io.ReaderFrom")
+	}
+
+	n, err := rf.ReadFrom(strings.NewReader("streamed-body"))
+	if err != nil {
+		t.Fatalf("ReadFrom returned error: %v", err)
+	}
+	if n != int64(len("streamed-body")) {
+		t.Errorf("ReadFrom returned n = %d, want %d", n, len("streamed-body"))
+	}
+	if !rec.readFromCalled {
+		t.Error("underlying ReadFrom() was never reached through statusCapturingWriter")
+	}
+}
+
+// TestStatusCapturingWriter_Status verifies the three ways a status code can
+// end up recorded: an explicit WriteHeader call, an implicit 200 from a bare
+// Write, and the zero value when nothing was ever written at all.
+func TestStatusCapturingWriter_Status(t *testing.T) {
+	t.Run("explicit WriteHeader", func(t *testing.T) {
+		sw := newStatusCapturingWriter(httptest.NewRecorder())
+		sw.WriteHeader(http.StatusCreated)
+		if sw.Status() != http.StatusCreated {
+			t.Errorf("Status() = %d, want %d", sw.Status(), http.StatusCreated)
+		}
+	})
+
+	t.Run("implicit 200 via bare Write", func(t *testing.T) {
+		sw := newStatusCapturingWriter(httptest.NewRecorder())
+		if _, err := sw.Write([]byte("ok")); err != nil {
+			t.Fatalf("Write returned error: %v", err)
+		}
+		if sw.Status() != http.StatusOK {
+			t.Errorf("Status() = %d, want %d", sw.Status(), http.StatusOK)
+		}
+	})
+
+	t.Run("first WriteHeader call wins", func(t *testing.T) {
+		sw := newStatusCapturingWriter(httptest.NewRecorder())
+		sw.WriteHeader(http.StatusCreated)
+		sw.WriteHeader(http.StatusInternalServerError)
+		if sw.Status() != http.StatusCreated {
+			t.Errorf("Status() = %d, want %d (first WriteHeader call must win)", sw.Status(), http.StatusCreated)
+		}
+	})
+
+	t.Run("nothing written at all", func(t *testing.T) {
+		sw := newStatusCapturingWriter(httptest.NewRecorder())
+		if sw.Status() != 0 {
+			t.Errorf("Status() = %d, want 0 when nothing was ever written", sw.Status())
+		}
+	})
+}
+
+// TestStatusCapturingWriter_PreservesFlusher is a regression test ensuring
+// statusCapturingWriter's embedded caddyhttp.ResponseWriterWrapper still
+// lets http.ResponseController reach the wrapped writer's Flush method via
+// Unwrap(), rather than silently swallowing flush calls — which would break
+// streaming/SSE responses proxied through this middleware. This is exactly
+// the http.NewResponseController(...).Flush() pattern reverse_proxy itself
+// uses to flush partial chunks of a streamed response as they arrive.
+//
+// httptest.ResponseRecorder already implements http.Flusher natively (its
+// own Flush() method sets the exported Flushed field), so no custom
+// test-double type is needed here, unlike the Hijacker/ReadFrom regression
+// tests above.
+func TestStatusCapturingWriter_PreservesFlusher(t *testing.T) {
+	rec := httptest.NewRecorder()
+	sw := newStatusCapturingWriter(rec)
+
+	if err := http.NewResponseController(sw).Flush(); err != nil {
+		t.Fatalf("Flush() through statusCapturingWriter failed: %v", err)
+	}
+
+	if !rec.Flushed {
+		t.Error("underlying Flush() was never reached through statusCapturingWriter")
+	}
+}
+
+// TestServeHTTP_PanicStillRecordsResponseMetricAndRepanics verifies, for
+// every mode, that a panicking backend does not cause
+// hansestack_leakcheck_responses_total to silently drop an observation, and
+// that the panic still propagates past ServeHTTP so Caddy's own recovery
+// middleware still sees and handles it — this plugin must never swallow a
+// downstream panic.
+func TestServeHTTP_PanicStillRecordsResponseMetricAndRepanics(t *testing.T) {
+	for _, mode := range []string{ModeObserve, ModeEnrichRequest, ModeEnrichResponse, ModeBlock} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+			defer cancel()
+
+			checker := &fakeChecker{leaked: false}
+			m := newTestMiddleware(checker)
+			m.Mode = mode
+			m.metrics = newMetrics(ctx)
+
+			r := jsonRequest(t, `{"password":"hunter2"}`)
+			w := httptest.NewRecorder()
+			next := nextHandler(func(http.ResponseWriter, *http.Request) {
+				panic("simulated backend panic")
+			})
+
+			func() {
+				defer func() {
+					rec := recover()
+					if rec == nil {
+						t.Fatal("panic did not propagate past ServeHTTP; it must reach Caddy's own recovery middleware")
+					}
+
+					// The panic happens before any write in every mode
+					// (including block's pass-through branch, since
+					// fakeChecker{leaked: false} never short-circuits), so
+					// the captured status is always 0 -> "unknown".
+					got := testutil.ToFloat64(m.metrics.responsesTotal.WithLabelValues(responseResultNotLeaked, "unknown"))
+					if got != 1 {
+						t.Errorf("responses_total{result=not_leaked, status_class=unknown} = %v, want 1 (metric must be recorded even on panic)", got)
+					}
+				}()
+
+				_ = m.ServeHTTP(w, r, next)
+			}()
+		})
 	}
 }
 
@@ -818,6 +1173,11 @@ func TestValidate(t *testing.T) {
 		{
 			name:    "valid",
 			m:       &Middleware{APIKey: "k", Mode: ModeEnrichRequest, BlockStatus: 401},
+			wantErr: false,
+		},
+		{
+			name:    "valid observe mode",
+			m:       &Middleware{APIKey: "k", Mode: ModeObserve, BlockStatus: 401},
 			wantErr: false,
 		},
 		{

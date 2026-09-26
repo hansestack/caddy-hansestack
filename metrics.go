@@ -23,6 +23,50 @@ const (
 	resultNotLeaked = "not_leaked"
 )
 
+// responseResultLabel values for the "result" label on responsesTotal. This
+// is a coarser vocabulary than checksTotal's: it collapses every fail-open
+// skip reason (timeout, rate limit, circuit open, error, canceled) into a
+// single "skipped" bucket, since responsesTotal's purpose is IoC
+// correlation ("did a leaked-password login succeed anyway?"), not root-
+// causing why a check didn't run — that remains checkOutcomesTotal's job.
+const (
+	responseResultLeaked    = "leaked"
+	responseResultNotLeaked = "not_leaked"
+	responseResultSkipped   = "skipped"
+)
+
+// statusClass buckets an HTTP status code into its class ("2xx", "4xx",
+// ...) for use as a bounded-cardinality Prometheus label. Exact status
+// codes are deliberately never used as a label value: a backend (especially
+// one reached via reverse_proxy to an arbitrary upstream) can emit any of
+// dozens of distinct codes, and an attacker who can influence the backend's
+// response can influence the code too. Bucketing by class keeps
+// responsesTotal's cardinality fixed regardless of what the backend does,
+// while still answering the IoC question that matters: did the request
+// ultimately succeed (2xx), redirect (3xx), get rejected (4xx), or fail
+// (5xx)?
+//
+// statusCode == 0 (no response was ever written, e.g. a hijacked
+// connection or a request that never reached a next.ServeHTTP call) and any
+// value outside the valid HTTP status range are reported as "unknown"
+// rather than silently misclassified.
+func statusClass(statusCode int) string {
+	switch {
+	case statusCode >= 100 && statusCode < 200:
+		return "1xx"
+	case statusCode >= 200 && statusCode < 300:
+		return "2xx"
+	case statusCode >= 300 && statusCode < 400:
+		return "3xx"
+	case statusCode >= 400 && statusCode < 500:
+		return "4xx"
+	case statusCode >= 500 && statusCode < 600:
+		return "5xx"
+	default:
+		return "unknown"
+	}
+}
+
 // metrics holds the Prometheus collectors this middleware reports. A single
 // set is shared by all Middleware instances provisioned from the same
 // caddy.Context (e.g. multiple "hansestack leakcheck" blocks in one
@@ -52,6 +96,30 @@ type metrics struct {
 	// rate signals a misconfiguration (e.g. a bad API key) that deserves
 	// operator attention, even though end users were never affected.
 	checkErrorsTotal prometheus.Counter
+
+	// responsesTotal is the dedicated Indicator-of-Compromise correlation
+	// counter: it pairs the leak-check result with the *backend's own*
+	// final HTTP response status class, e.g.
+	// responses_total{result="leaked", status_class="2xx"} means a request
+	// carrying a breached password nonetheless reached the backend and got
+	// a successful response — the strongest, most actionable signal this
+	// plugin can offer an operator watching a dashboard.
+	//
+	// Deliberately kept separate from checksTotal rather than adding
+	// status_class as an extra label there: checksTotal is incremented the
+	// moment the leak check itself completes, a point that in some modes
+	// (observe, enrich_response) is temporally decoupled from — or
+	// concurrent with — the backend actually producing a response.
+	// responsesTotal is only ever incremented once the backend's status is
+	// known, so its absence or delay (e.g. a hijacked connection, a
+	// panicking backend) never affects the always-reliable checksTotal.
+	//
+	// The "result" label uses the coarser responseResult* vocabulary
+	// ("leaked", "not_leaked", "skipped") rather than checksTotal's two-
+	// value one, and "status_class" is bucketed ("2xx", "4xx", ...) rather
+	// than the exact status code, to keep cardinality strictly bounded
+	// regardless of what the backend returns.
+	responsesTotal *prometheus.CounterVec
 }
 
 // newMetrics registers this plugin's Prometheus collectors against ctx's
@@ -84,10 +152,18 @@ func newMetrics(ctx caddy.Context) *metrics {
 		Help:      "Total number of leak checks that fell back to fail-open because the Hansestack API client returned an error.",
 	})
 
+	responsesTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "responses_total",
+		Help:      "Indicator-of-Compromise correlation counter: total number of requests labeled by leak-check result (leaked, not_leaked, skipped) and the backend's final HTTP response status class (2xx, 3xx, 4xx, 5xx). Status codes are bucketed by class to keep cardinality bounded.",
+	}, []string{"result", "status_class"})
+
 	return &metrics{
 		checksTotal:        mustRegisterOrReuseVec(registry, checksTotal),
 		checkOutcomesTotal: mustRegisterOrReuseVec(registry, checkOutcomesTotal),
 		checkErrorsTotal:   mustRegisterOrReuseCounter(registry, checkErrorsTotal),
+		responsesTotal:     mustRegisterOrReuseVec(registry, responsesTotal),
 	}
 }
 
@@ -145,4 +221,38 @@ func (m *metrics) observe(res leakResult, err error) {
 	}
 
 	m.checkOutcomesTotal.WithLabelValues(res.outcome.String()).Inc()
+}
+
+// responseResult classifies res into the coarse vocabulary used by
+// responsesTotal's "result" label. A check that was skipped under fail-open
+// (any outcome other than leakcheck.OutcomeChecked) is reported as
+// "skipped" here, regardless of the neutral res.leaked value it carries —
+// conflating a genuine "confirmed not leaked" with "the check never ran"
+// would defeat the whole purpose of this correlation metric.
+func responseResult(res leakResult) string {
+	if !res.outcome.Checked() {
+		return responseResultSkipped
+	}
+	if res.leaked {
+		return responseResultLeaked
+	}
+	return responseResultNotLeaked
+}
+
+// observeResponse records the Indicator-of-Compromise correlation signal:
+// the leak-check result paired with the backend's final HTTP response
+// status, once that status is known. Unlike observe, this is called from
+// the request pipeline only after next.ServeHTTP has produced (or failed to
+// produce) a status code, which may be well after — or, in concurrent
+// modes, independently of — the check itself completing.
+//
+// statusCode is bucketed via statusClass before being used as a label value
+// to keep cardinality bounded; see statusClass for why exact codes are
+// never used here.
+func (m *metrics) observeResponse(res leakResult, statusCode int) {
+	if m == nil {
+		return
+	}
+
+	m.responsesTotal.WithLabelValues(responseResult(res), statusClass(statusCode)).Inc()
 }
