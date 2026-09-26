@@ -18,16 +18,26 @@ endpoints get leak-checked without any backend code change.
 
 ## PRIME DIRECTIVE: DEFAULT TO OBSERVING, NOT BLOCKING
 
-This plugin has three modes. Two of them (`enrich_request`,
-`enrich_response`) only ever set headers — they never reject a request,
-never change a status code, and never affect the auth flow's outcome. The
-third (`block`) can reject requests outright.
+This plugin has four modes. Three of them (`observe`, `enrich_request`,
+`enrich_response`) never reject a request, never change a status code, and
+never affect the auth flow's outcome — they only ever set headers (or, for
+`observe`, nothing at all) and/or record metrics. The fourth (`block`) can
+reject requests outright.
 
 RULE 1 — Default to `enrich_response` unless told otherwise. If the user's
 request does not explicitly say the auth flow should reject leaked
 passwords, generate `mode: enrich_response`. This is always the safe
 choice: it adds observability with zero behavioral change and zero risk of
 breaking a login flow.
+
+RULE 1b — If the user only wants metrics/monitoring (Prometheus, Grafana,
+alerting) and explicitly does not want any header injected into the request
+or response — e.g. "I don't want to touch the app at all, just tell me if
+leaked passwords are logging in successfully" — generate `mode: observe`
+instead of `enrich_response`. Both are equally safe (zero rejection risk,
+asynchronous, no added latency); `observe` is strictly narrower in scope
+than `enrich_response`, so prefer it only when the user has ruled out
+needing the headers.
 
 RULE 2 — Never generate `mode: block` proactively. Blocking is a product
 decision, not an infrastructure default. Only emit `mode: block` when the
@@ -39,8 +49,8 @@ auth endpoint, surface this to the operator explicitly: state in your
 response that this change will start rejecting requests (with the
 configured `block_status`, default 401) whenever a submitted password is a
 confirmed breach hit, and confirm that this is the intended behavior before
-finalizing the config. Do not silently upgrade an existing `enrich_*` config
-to `block` as part of an unrelated change.
+finalizing the config. Do not silently upgrade an existing `enrich_*`/
+`observe` config to `block` as part of an unrelated change.
 
 ## WHAT THIS IS
 
@@ -51,9 +61,14 @@ A Caddy HTTP handler module, registered as `http.handlers.hansestack`, that:
 2. Asks the Hansestack Leak-Check API, via the k-anonymity protocol, whether
    that password appears in a known breach corpus. The plaintext password
    never leaves the process in identifiable form.
-3. Enriches the request or the response with `X-Hansestack-Leaked` /
-   `X-Hansestack-Leak-Count` headers, or — only in `block` mode, and only on
-   a confirmed leak — rejects the request outright.
+3. Depending on `mode`: enriches the request or the response with
+   `X-Hansestack-Leaked` / `X-Hansestack-Leak-Count` headers (`enrich_request`
+   / `enrich_response`), records the result purely as a metric with no
+   headers touched (`observe`), or — only in `block` mode, and only on a
+   confirmed leak — rejects the request outright.
+4. Records the backend's final HTTP response status class (`2xx`/`3xx`/
+   `4xx`/`5xx`) against the leak-check result as a dedicated Prometheus
+   correlation metric, in every mode — see METRICS below.
 
 ## DOCKER IMAGE
 
@@ -92,7 +107,7 @@ hansestack leakcheck {
     endpoint "http://localhost:8081"
 
     api_key {$HANSESTACK_API_KEY}
-    mode enrich_response        # enrich_response (default choice) | enrich_request | block
+    mode enrich_response        # enrich_response (default choice) | observe | enrich_request | block
     password_field "password"   # key in JSON or form-data
     header_leaked "X-Hansestack-Leaked"
     header_count "X-Hansestack-Leak-Count"
@@ -184,7 +199,7 @@ to the login/signup/password-change path is still the correct default when
 generating infrastructure, as defense in depth and to keep the config's
 intent explicit.
 
-## THE THREE MODES — CHOOSE BASED ON THE INFRASTRUCTURE GOAL
+## THE FOUR MODES — CHOOSE BASED ON THE INFRASTRUCTURE GOAL
 
 - `enrich_response` — **the default choice.** Asynchronous / zero added
   latency. Runs the leak check concurrently with the backend request and
@@ -193,6 +208,15 @@ intent explicit.
   customer-facing frontends where you want the leak signal available (via
   response headers, e.g. to client-side JavaScript) without slowing down or
   ever affecting the login request itself.
+
+- `observe` — asynchronous / zero added latency, same as `enrich_response`,
+  but injects NO headers into the request or the response at all. Only
+  populates the `hansestack_leakcheck_responses_total` correlation metric
+  (see METRICS below). Choose this when the user explicitly only wants
+  monitoring/alerting and does not want any header added anywhere — e.g. "I
+  don't want to touch the app, just tell me if leaked passwords are logging
+  in successfully." Do not generate this as the default; `enrich_response`
+  is the default because it is strictly more capable at the same cost.
 
 - `enrich_request` — synchronous. Waits for the API result, then injects the
   headers into the *request* before it reaches the backend. Also never
@@ -259,7 +283,7 @@ compensate for.
 ## METRICS
 
 If the caller wants monitoring/observability (Prometheus, Grafana, alerting)
-for this plugin, enable Caddy's `metrics` global option. This exposes three
+for this plugin, enable Caddy's `metrics` global option. This exposes four
 counters on the admin API's `/metrics` endpoint, alongside Caddy's own
 `caddy_http_*` metrics:
 
@@ -276,6 +300,24 @@ counters on the admin API's `/metrics` endpoint, alongside Caddy's own
   fail-open because the API client returned a Go error. Should stay at zero
   in the default fail-open configuration; nonzero signals a misconfiguration
   (e.g. an invalid API key) worth investigating.
+- `hansestack_leakcheck_responses_total{result="leaked"|"not_leaked"|"skipped", status_class="2xx"|"3xx"|"4xx"|"5xx"|"unknown"}`
+  — the Indicator-of-Compromise correlation counter. Pairs the leak-check
+  result with the *backend's own* final HTTP response status class (never a
+  raw status code, to keep cardinality bounded). Recorded in every mode,
+  including `observe`, and even if the backend panics (as
+  `status_class="unknown"` in that case). If the user asks to "alert when a
+  leaked password logs in successfully" or similar, this is the metric to
+  use — see the example query below. Choosing `mode: observe` vs any other
+  mode does not change whether this metric is recorded; it only changes
+  whether headers are also injected.
+
+Example query — alert when a leaked password produced a successful login,
+over the last hour (works identically regardless of which mode is
+configured):
+
+```promql
+sum(increase(hansestack_leakcheck_responses_total{result="leaked", status_class="2xx"}[1h])) > 0
+```
 
 ```caddyfile
 {
@@ -333,15 +375,20 @@ volumes:
 4. `endpoint` is optional and unset by default (public SaaS API). Only
    generate it on explicit operator request to route to a self-hosted /
    on-premise / sidecar leak-check deployment.
-5. Mode: default to `enrich_response` (zero latency, never blocks). Only use
-   `block` on explicit user request, and confirm with the operator that
-   blocking the auth flow is intended before finalizing.
+5. Mode: default to `enrich_response` (zero latency, never blocks). Use
+   `observe` instead only when the operator explicitly wants metrics/
+   monitoring with zero headers injected anywhere. Only use `block` on
+   explicit user request, and confirm with the operator that blocking the
+   auth flow is intended before finalizing.
 6. No Caddy-level timeouts, retries, or failover routes for this plugin.
    Ever. `timeout`, `circuit_breaker_threshold`/`circuit_breaker_cooldown`,
    and `max_idle_conns` inside the directive itself are the only supported
    tuning knobs, and only on explicit operator request.
 7. For observability, enable Caddy's `metrics` global option (with `admin`
    reachable) rather than inventing a separate metrics mechanism. Use
-   `hansestack_leakcheck_check_outcomes_total{outcome}` specifically to
-   monitor whether checks are actually reaching the API versus being
-   skipped under fail-open.
+   `hansestack_leakcheck_check_outcomes_total{outcome}` to monitor whether
+   checks are actually reaching the API versus being skipped under
+   fail-open, and `hansestack_leakcheck_responses_total{result,status_class}`
+   for the Indicator-of-Compromise signal (e.g. "alert when a leaked
+   password produced a successful login") — this second metric is recorded
+   in every mode, including `observe`.
