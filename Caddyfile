@@ -31,6 +31,8 @@
 	# their request bodies at all.
 	hansestack /login* leakcheck {
 		api_key {$HANSESTACK_API_KEY}
+		endpoint {$HANSESTACK_ENDPOINT:https://api.hansestack.de/leakcheck}
+
 		mode enrich_request
 		password_field "password"
 		header_leaked "X-Hansestack-Leaked"

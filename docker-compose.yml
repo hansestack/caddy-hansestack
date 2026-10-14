@@ -27,6 +27,11 @@ services:
       # only the {$HANSESTACK_API_KEY} placeholder does. Caddy resolves it
       # from this environment variable at config-load time.
       HANSESTACK_API_KEY: ${HANSESTACK_API_KEY:?HANSESTACK_API_KEY must be set}
+      # Optional: base URL of the Leak-Check API, resolved by the Caddyfile's
+      # {$HANSESTACK_ENDPOINT:default} placeholder. Leave unset in .env to
+      # keep hitting the public Hansestack SaaS API; point it at a
+      # self-hosted/on-premise deployment instead (e.g. a sidecar) if needed.
+      HANSESTACK_ENDPOINT: ${HANSESTACK_ENDPOINT:-https://api.hansestack.de/leakcheck}
       # Optional tuning knobs for the Leak-Check API client, resolved by the
       # Caddyfile's {$VAR:default} placeholders below. Leave unset in .env to
       # keep hansestack-go's own defaults (500ms timeout, circuit breaker
